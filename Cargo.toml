@@ -76,3 +76,6 @@ deno_webidl = "0.244.0"
 deno_websocket = "0.249.0"
 deno_webstorage = "0.239.0"
 sys_traits = "0.1.27"
+
+[patch.crates-io]
+deno_fetch = { path = "vendor/deno_fetch" }

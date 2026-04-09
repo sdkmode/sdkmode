@@ -1585,8 +1585,6 @@ dependencies = [
 [[package]]
 name = "deno_fetch"
 version = "0.268.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74d73b60ad098c2a72ad19a11d7369c670c9e8ed3206860c4da514709f4244a0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
