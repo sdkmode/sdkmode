@@ -612,6 +612,13 @@ pub async fn op_fetch_send(
   state: Rc<RefCell<OpState>>,
   #[smi] rid: ResourceId,
 ) -> Result<FetchResponse, FetchError> {
+  op_fetch_send_inner(state, rid).await
+}
+
+async fn op_fetch_send_inner(
+  state: Rc<RefCell<OpState>>,
+  rid: ResourceId,
+) -> Result<FetchResponse, FetchError> {
   let request = state
     .borrow_mut()
     .resource_table
