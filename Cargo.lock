@@ -2267,6 +2267,7 @@ dependencies = [
  "async-trait",
  "boxed_error",
  "color-print",
+ "deno_ast",
  "deno_bundle_runtime",
  "deno_cache",
  "deno_core",
@@ -6441,6 +6442,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deno_ast",
+ "deno_bundle_runtime",
  "deno_cache",
  "deno_core",
  "deno_cron",
