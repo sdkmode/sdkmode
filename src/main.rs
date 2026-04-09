@@ -1,6 +1,6 @@
 mod esm_loader;
 mod extensions;
-mod fetch;
+pub(crate) mod fetch;
 
 fn main() {
     let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();

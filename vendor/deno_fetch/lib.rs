@@ -615,7 +615,7 @@ pub async fn op_fetch_send(
   op_fetch_send_inner(state, rid).await
 }
 
-async fn op_fetch_send_inner(
+pub async fn op_fetch_send_inner(
   state: Rc<RefCell<OpState>>,
   rid: ResourceId,
 ) -> Result<FetchResponse, FetchError> {

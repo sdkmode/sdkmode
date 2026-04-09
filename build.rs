@@ -1,3 +1,7 @@
+mod fetch {
+    include!("src/fetch.rs");
+}
+
 mod extensions {
     include!("src/extensions.rs");
 }

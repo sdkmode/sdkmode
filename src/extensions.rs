@@ -7,6 +7,7 @@ pub fn extensions(
         deno_web::deno_web::lazy_init(),
         deno_webgpu::deno_webgpu::init(),
         deno_fetch::deno_fetch::lazy_init(),
+        crate::fetch::custom_fetch_extension(),
         deno_cache::deno_cache::lazy_init(),
         deno_websocket::deno_websocket::lazy_init(),
         deno_webstorage::deno_webstorage::lazy_init(),
