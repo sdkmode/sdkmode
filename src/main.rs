@@ -1,12 +1,18 @@
+mod esm_loader;
 mod extensions;
 
 fn main() {
+    let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     if let Err(error) = runtime.block_on(execute_module(
-        r#"console.log("Hello, world!");"#.to_owned(),
+        r#"
+        import { Octokit } from "@octokit/rest";
+        console.log("Octokit loaded:", typeof Octokit);"#
+            .to_owned(),
     )) {
         eprintln!("error: {}", error);
     }
@@ -60,8 +66,10 @@ fn bootstrap_runtime(
 }
 
 async fn execute_module(code: String) -> Result<(), anyhow::Error> {
+    let module_loader = std::rc::Rc::new(esm_loader::EsmLoader::new()?);
     let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
         startup_snapshot: Some(RUNTIME_SNAPSHOT),
+        module_loader: Some(module_loader),
         extensions: extensions::extensions(Some(
             deno_runtime::ops::bootstrap::SnapshotOptions::default(),
         )),
@@ -101,7 +109,8 @@ async fn execute_module(code: String) -> Result<(), anyhow::Error> {
         >(None, fs.clone()),
         deno_runtime::ops::runtime::deno_runtime::args(specifier.clone()),
         deno_runtime::ops::worker_host::deno_worker_host::args(
-            std::sync::Arc::new(|_| unimplemented!("worker api not supported")),
+            // TODO (he1d1): swap unimplemented! for an error
+            std::sync::Arc::new(|_| unimplemented!("Worker API not supported.")),
             None,
         ),
         deno_bundle_runtime::deno_bundle_runtime::args(None),

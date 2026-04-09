@@ -6471,6 +6471,8 @@ dependencies = [
  "deno_webidl",
  "deno_websocket",
  "deno_webstorage",
+ "http 1.4.0",
+ "http-body-util",
  "icu_calendar",
  "icu_locale",
  "sys_traits",
