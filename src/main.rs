@@ -1,3 +1,9 @@
+use std::sync::Arc;
+
+use deno_runtime::{
+    deno_permissions::PermissionsContainer, permissions::RuntimePermissionDescriptorParser,
+};
+
 mod esm_loader;
 mod extensions;
 pub(crate) mod fetch;
@@ -12,7 +18,15 @@ fn main() {
     if let Err(error) = runtime.block_on(execute_module(
         r#"
         import { Octokit } from "@octokit/rest";
-        console.log("Octokit loaded:", typeof Octokit);"#
+        const octokit = new Octokit();
+
+        const res = await octokit.rest.repos.get({
+            owner: "denoland",
+            repo: "deno",
+        });
+
+        console.log(res.data.full_name);
+        console.log(res.data.stargazers_count);"#
             .to_owned(),
     )) {
         eprintln!("error: {}", error);
@@ -116,6 +130,16 @@ async fn execute_module(code: String) -> Result<(), anyhow::Error> {
         ),
         deno_bundle_runtime::deno_bundle_runtime::args(None),
     ])?;
+
+    {
+        let state = runtime.op_state();
+        let mut state = state.borrow_mut();
+
+        let permission_desc_parser = Arc::new(RuntimePermissionDescriptorParser::new(
+            sys_traits::impls::RealSys,
+        ));
+        state.put::<PermissionsContainer>(PermissionsContainer::allow_all(permission_desc_parser));
+    }
 
     bootstrap_runtime(
         &mut runtime,
