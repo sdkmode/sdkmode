@@ -1,5 +1,7 @@
 use deno_core::op2;
 use deno_core::{OpState, ResourceId};
+use deno_fetch::FetchRequestResource;
+use std::rc::Rc;
 
 pub fn custom_fetch_extension() -> deno_core::Extension {
     deno_core::Extension {
@@ -17,5 +19,14 @@ pub async fn op_fetch_send(
     state: std::rc::Rc<std::cell::RefCell<OpState>>,
     #[smi] rid: ResourceId,
 ) -> Result<deno_fetch::FetchResponse, deno_fetch::FetchError> {
-    deno_fetch::op_fetch_send_inner(state, rid).await
+    let request = state
+        .borrow_mut()
+        .resource_table
+        .take::<FetchRequestResource>(rid)?;
+
+    let request = Rc::try_unwrap(request)
+        .ok()
+        .expect("multiple op_fetch_send ongoing");
+
+    deno_fetch::op_fetch_send_inner(state, request).await
 }
