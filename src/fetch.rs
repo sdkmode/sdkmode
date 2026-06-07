@@ -1,32 +1,28 @@
 use deno_core::op2;
 use deno_core::{OpState, ResourceId};
-use deno_fetch::FetchRequestResource;
+use deno_error::JsErrorBox;
+use deno_fetch::{ReqBody, RequestBuilder};
+use http;
+use std::pin::Pin;
 use std::rc::Rc;
+
+struct RequestInterceptor {}
+
+impl RequestBuilder for RequestInterceptor {
+    fn hook<'a>(
+        &'a self,
+        request: &'a mut http::Request<ReqBody>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), JsErrorBox>> + Send + 'a>> {
+        todo!()
+    }
+}
 
 pub fn custom_fetch_extension() -> deno_core::Extension {
     deno_core::Extension {
         name: "custom_fetch",
-        middleware_fn: Some(Box::new(|op| match op.name {
-            "op_fetch_send" => op.with_implementation_from(&op_fetch_send()),
-            _ => op,
+        op_state_fn: Some(Box::new(|state: &mut OpState| {
+            state.put(RequestInterceptor {});
         })),
         ..Default::default()
     }
-}
-
-#[op2]
-pub async fn op_fetch_send(
-    state: std::rc::Rc<std::cell::RefCell<OpState>>,
-    #[smi] rid: ResourceId,
-) -> Result<deno_fetch::FetchResponse, deno_fetch::FetchError> {
-    let request = state
-        .borrow_mut()
-        .resource_table
-        .take::<FetchRequestResource>(rid)?;
-
-    let request = Rc::try_unwrap(request)
-        .ok()
-        .expect("multiple op_fetch_send ongoing");
-
-    deno_fetch::op_fetch_send_inner(state, request).await
 }

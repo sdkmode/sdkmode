@@ -95,6 +95,13 @@ use tower::ServiceExt;
 use tower::retry;
 use tower_http::decompression::Decompression;
 
+pub trait RequestBuilder: Send + Sync {
+    fn hook<'a>(
+        &'a self,
+        request: &'a mut http::Request<ReqBody>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), JsErrorBox>> + Send + 'a>>;
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub user_agent: String,
@@ -111,7 +118,7 @@ pub struct Options {
     /// For more info on what can be configured, see [`hyper_util::client::legacy::Builder`].
     pub client_builder_hook: Option<fn(HyperClientBuilder) -> HyperClientBuilder>,
     #[allow(clippy::type_complexity, reason = "TODO: improve")]
-    pub request_builder_hook: Option<fn(&mut http::Request<ReqBody>) -> Result<(), JsErrorBox>>,
+    pub request_builder_hook: Option<Arc<dyn RequestBuilder>>,
     pub unsafely_ignore_certificate_errors: Option<Vec<String>>,
     pub client_cert_chain_and_key: TlsKeys,
     pub file_fetch_handler: Rc<dyn FetchHandler>,
@@ -514,20 +521,22 @@ pub fn op_fetch(
             }
 
             let options = state.borrow::<Options>();
-            if let Some(request_builder_hook) = options.request_builder_hook {
-                request_builder_hook(&mut request).map_err(FetchError::RequestBuilderHook)?;
-            }
+            let request_builder_hook = options.request_builder_hook.clone();
 
             let cancel_handle = CancelHandle::new_rc();
             let cancel_handle_ = cancel_handle.clone();
 
             let fut = async move {
-                client
-                    .send(request)
-                    .map_err(Into::into)
-                    .or_cancel(cancel_handle_)
-                    .await
-            };
+                if let Some(request_builder_hook) = request_builder_hook {
+                    request_builder_hook
+                        .hook(&mut request)
+                        .await
+                        .map_err(FetchError::RequestBuilderHook);
+                }
+
+                client.send(request).map_err(Into::into).await
+            }
+            .or_cancel(cancel_handle_);
 
             let request_rid = state.resource_table.add(FetchRequestResource {
                 future: Box::pin(fut),
@@ -604,13 +613,6 @@ pub async fn op_fetch_send(
         .ok()
         .expect("multiple op_fetch_send ongoing");
 
-    op_fetch_send_inner(state, request).await
-}
-
-pub async fn op_fetch_send_inner(
-    state: Rc<RefCell<OpState>>,
-    request: FetchRequestResource,
-) -> Result<FetchResponse, FetchError> {
     let res = match request.future.await {
         Ok(Ok(res)) => res,
         Ok(Err(err)) => {
