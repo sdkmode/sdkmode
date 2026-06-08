@@ -3,6 +3,7 @@ use std::sync::Arc;
 use deno_runtime::{
     deno_permissions::PermissionsContainer, permissions::RuntimePermissionDescriptorParser,
 };
+use fetch::fetch_options;
 
 mod esm_loader;
 mod extensions;
@@ -100,7 +101,7 @@ async fn execute_module(code: String) -> Result<(), anyhow::Error> {
             None,
             deno_web::InMemoryBroadcastChannel::default(),
         ),
-        deno_fetch::deno_fetch::args(Default::default()),
+        deno_fetch::deno_fetch::args(fetch_options()),
         deno_cache::deno_cache::args(None),
         deno_websocket::deno_websocket::args(),
         deno_webstorage::deno_webstorage::args(None),
