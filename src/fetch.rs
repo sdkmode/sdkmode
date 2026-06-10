@@ -1,6 +1,4 @@
 use core::future::ready;
-use deno_core::op2;
-use deno_core::{OpState, ResourceId};
 use deno_error::JsErrorBox;
 use deno_fetch::{ReqBody, RequestBuilder};
 use http;
@@ -18,7 +16,7 @@ impl RequestBuilder for RequestInterceptor {
     }
 }
 
-pub fn fetch_options() -> deno_fetch::Options {
+pub(crate) fn fetch_options() -> deno_fetch::Options {
     deno_fetch::Options {
         request_builder_hook: Some(Arc::new(RequestInterceptor {})),
         ..Default::default()
