@@ -6473,6 +6473,7 @@ dependencies = [
  "http-body-util",
  "icu_calendar",
  "icu_locale",
+ "serde_json",
  "sys_traits",
  "tokio",
  "url",
