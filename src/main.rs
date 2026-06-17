@@ -3,6 +3,7 @@ mod extensions;
 pub(crate) mod fetch;
 mod mcp;
 mod sandbox;
+pub(crate) mod sdk;
 
 fn main() {
     let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
