@@ -46,4 +46,8 @@ impl super::Sdk for GitHub {
     fn cookies(&self) -> Option<HashMap<String, String>> {
         Some(HashMap::<String, String>::new())
     }
+
+    fn packages(&self) -> &'static [&'static str] {
+        &["@octokit/rest"]
+    }
 }

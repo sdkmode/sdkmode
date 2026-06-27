@@ -46,6 +46,17 @@ pub struct ExecutionResult {
     pub error: Option<String>,
 }
 
+/// The result of running one step of a [`Session`] turn.
+pub struct StepResult {
+    /// Captured `console` output — the agent's scratchpad for this step.
+    pub output: String,
+    /// The error message if the step threw, otherwise `None`.
+    pub error: Option<String>,
+    /// The value the step `return`ed (the answer to the user). `None` means the
+    /// step did not return, so the agent should take another step.
+    pub value: Option<String>,
+}
+
 /// Build a [`deno_io::Stdio`] that sends the runtime's stdout to the process
 /// stderr. The MCP transport uses stdout for JSON-RPC, so any stray writes the
 /// guest makes (e.g. `Deno.stdout.write`) must be kept away from it. Captured
@@ -131,10 +142,9 @@ fn read_global_string(runtime: &mut deno_core::JsRuntime, expr: &'static str) ->
         .unwrap_or_default()
 }
 
-/// Execute a JavaScript ES module in a fresh sandboxed Deno runtime, returning
-/// its captured `console` output and any error it raised. Each call gets an
-/// isolated runtime, so state does not leak between executions.
-pub async fn execute_code(code: String) -> Result<ExecutionResult, anyhow::Error> {
+/// Build a sandboxed Deno runtime with all extensions, permissions, and the
+/// console-[`CAPTURE_SHIM`] installed, ready to load modules or run scripts.
+fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
     let module_loader = std::rc::Rc::new(crate::esm_loader::EsmLoader::new()?);
     let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
         startup_snapshot: Some(RUNTIME_SNAPSHOT),
@@ -189,10 +199,27 @@ pub async fn execute_code(code: String) -> Result<ExecutionResult, anyhow::Error
         let state = runtime.op_state();
         let mut state = state.borrow_mut();
 
-        let permission_desc_parser = Arc::new(RuntimePermissionDescriptorParser::new(
+        let parser = Arc::new(RuntimePermissionDescriptorParser::new(
             sys_traits::impls::RealSys,
         ));
-        state.put::<PermissionsContainer>(PermissionsContainer::allow_all(permission_desc_parser));
+
+        // Least privilege: the guest may read the working directory and use the
+        // network (the fetch broker handles credentials and SSRF blocking).
+        // Everything else — env, fs writes, subprocess, FFI, system info — is
+        // denied. Credentials live host-side, so this does not affect SDK auth.
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string());
+        let options = deno_runtime::deno_permissions::PermissionsOptions {
+            allow_read: Some(vec![cwd.clone()]),
+            allow_write: Some(vec![cwd]),
+            allow_net: Some(vec![]), // all hosts; gated by the fetch broker
+            ..Default::default()
+        };
+        let permissions =
+            deno_runtime::deno_permissions::Permissions::from_options(parser.as_ref(), &options)
+                .map_err(|error| anyhow::anyhow!("failed to build permissions: {error}"))?;
+        state.put::<PermissionsContainer>(PermissionsContainer::new(parser, permissions));
     }
 
     bootstrap_runtime(
@@ -206,6 +233,17 @@ pub async fn execute_code(code: String) -> Result<ExecutionResult, anyhow::Error
     runtime
         .execute_script("[sdkmode:capture]", CAPTURE_SHIM)
         .map_err(|error| anyhow::anyhow!("failed to install capture shim: {}", error))?;
+
+    Ok(runtime)
+}
+
+/// Execute a JavaScript ES module in a fresh sandboxed Deno runtime, returning
+/// its captured `console` output and any error it raised. Each call gets an
+/// isolated runtime, so state does not leak between executions. Used by the MCP
+/// server; the REPL uses [`Session`] for persistent state.
+pub async fn execute_code(code: String) -> Result<ExecutionResult, anyhow::Error> {
+    let mut runtime = build_runtime()?;
+    let specifier = deno_core::ModuleSpecifier::parse("file:///main.js")?;
 
     let mut error = None;
     match runtime
@@ -228,4 +266,183 @@ pub async fn execute_code(code: String) -> Result<ExecutionResult, anyhow::Error
     let output = read_global_string(&mut runtime, READ_OUTPUT);
 
     Ok(ExecutionResult { output, error })
+}
+
+/// A long-lived sandbox runtime whose global state persists across evaluations.
+///
+/// The REPL keeps one of these for the whole session so that variables a turn
+/// declares remain visible to later turns (see [`crate::transform::wrap_turn`],
+/// which lifts each turn's top-level bindings onto `globalThis`).
+pub struct Session {
+    runtime: deno_core::JsRuntime,
+}
+
+impl Session {
+    /// Create a session and seed `globalThis.octokit` with an authenticated
+    /// client, so every turn can use it without importing.
+    pub async fn new() -> Result<Self, anyhow::Error> {
+        let mut runtime = build_runtime()?;
+        let specifier = deno_core::ModuleSpecifier::parse("file:///main.js")?;
+
+        // Static import is loaded as the (single) main module — the proven path
+        // for resolving `@octokit/rest` — then stashed on the global scope.
+        let init = "import { Octokit } from \"@octokit/rest\";\n\
+                    globalThis.octokit = new Octokit();\n";
+        let module_id = runtime
+            .load_main_es_module_from_code(&specifier, init.to_string())
+            .await
+            .map_err(|error| anyhow::anyhow!("session init failed to load: {error}"))?;
+        let evaluate = runtime.mod_evaluate(module_id);
+        runtime
+            .run_event_loop(Default::default())
+            .await
+            .map_err(|error| anyhow::anyhow!("session init event loop failed: {error}"))?;
+        evaluate
+            .await
+            .map_err(|error| anyhow::anyhow!("session init failed: {error}"))?;
+
+        Ok(Self { runtime })
+    }
+
+    /// Run one step's script (already wrapped by [`crate::transform::wrap_turn`])
+    /// against the persistent global scope. Returns the captured scratchpad
+    /// output, any error, and the value the step `return`ed. State assigned to
+    /// `globalThis` survives into the next call.
+    pub async fn eval(&mut self, code: String) -> Result<StepResult, anyhow::Error> {
+        // Start each step with an empty scratchpad and cleared return slots, so
+        // a prior step's answer can't leak if this one fails to compile.
+        self.runtime
+            .execute_script(
+                "[sdkmode:reset]",
+                "globalThis.__sdkmode_output.length = 0; \
+                 globalThis.__sdkmode_returned = false; \
+                 globalThis.__sdkmode_value = undefined;",
+            )
+            .map_err(|error| anyhow::anyhow!("failed to reset session state: {error}"))?;
+
+        let mut error = None;
+        match self.runtime.execute_script("[sdkmode:turn]", code) {
+            Ok(promise) => {
+                let resolve = self.runtime.resolve(promise);
+                if let Err(event_loop_error) = self
+                    .runtime
+                    .with_event_loop_promise(resolve, deno_core::PollEventLoopOptions::default())
+                    .await
+                {
+                    error = Some(event_loop_error.to_string());
+                }
+            }
+            Err(execute_error) => {
+                error = Some(execute_error.to_string());
+            }
+        }
+
+        let output = read_global_string(&mut self.runtime, READ_OUTPUT);
+        let returned = read_global_string(
+            &mut self.runtime,
+            "globalThis.__sdkmode_returned ? '1' : '0'",
+        ) == "1";
+        let value =
+            returned.then(|| read_global_string(&mut self.runtime, "globalThis.__sdkmode_value"));
+
+        Ok(StepResult {
+            output,
+            error,
+            value,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+
+    #[tokio::test]
+    async fn state_persists_across_evals() {
+        // Session::new loads @octokit/rest over TLS, which needs a crypto
+        // provider; main() installs this, but the test harness does not.
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let mut session = Session::new().await.expect("session");
+
+        let first = session
+            .eval(crate::transform::wrap_turn("const x = 21;"))
+            .await
+            .unwrap();
+        assert!(
+            first.error.is_none(),
+            "first eval errored: {:?}",
+            first.error
+        );
+
+        // A later turn sees `x` declared earlier, and a bare expression prints.
+        let second = session
+            .eval(crate::transform::wrap_turn("x * 2"))
+            .await
+            .unwrap();
+        assert!(
+            second.error.is_none(),
+            "second eval errored: {:?}",
+            second.error
+        );
+        assert_eq!(second.output, "42");
+        // A bare expression is scratchpad, not an answer.
+        assert_eq!(second.value, None);
+    }
+
+    #[tokio::test]
+    async fn return_value_is_the_answer() {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut session = Session::new().await.expect("session");
+
+        // console.log is scratchpad: captured, but not an answer.
+        let scratch = session
+            .eval(crate::transform::wrap_turn("console.log('thinking')"))
+            .await
+            .unwrap();
+        assert_eq!(scratch.output, "thinking");
+        assert_eq!(scratch.value, None);
+
+        // `return` ends the turn with a value for the user.
+        let answered = session
+            .eval(crate::transform::wrap_turn("return 1 + 1;"))
+            .await
+            .unwrap();
+        assert_eq!(answered.value.as_deref(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn lockdown_denies_env_fs_and_unlisted_imports() {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut session = Session::new().await.expect("session");
+
+        // Reading environment variables is denied.
+        let env = session
+            .eval(crate::transform::wrap_turn("Deno.env.get('PATH')"))
+            .await
+            .unwrap();
+        assert!(
+            env.error.is_some(),
+            "env access should be denied (output={:?})",
+            env.output
+        );
+
+        // Reading files outside the working directory is denied.
+        let fs = session
+            .eval(crate::transform::wrap_turn(
+                "await Deno.readTextFile('/etc/passwd')",
+            ))
+            .await
+            .unwrap();
+        assert!(fs.error.is_some(), "out-of-cwd read should be denied");
+
+        // Importing a package no SDK registered is rejected by the loader.
+        let import = session
+            .eval(crate::transform::wrap_turn(
+                "await import('https://esm.sh/lodash')",
+            ))
+            .await
+            .unwrap();
+        assert!(import.error.is_some(), "unlisted import should be rejected");
+    }
 }
