@@ -7,6 +7,8 @@ use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
 use deno_core::ModuleType;
 use deno_core::ResolutionKind;
+use std::collections::HashMap;
+
 use deno_core::error::ModuleLoaderError;
 use deno_core::resolve_import;
 use deno_error::JsErrorBox;
@@ -14,19 +16,22 @@ use http::Request;
 use http::header::LOCATION;
 use http_body_util::BodyExt;
 
-const OCTOKIT_SPECIFIER: &str = "@octokit/rest";
-const OCTOKIT_ESM_SH_URL: &str = "https://esm.sh/@octokit/rest";
+const ESM_SH: &str = "https://esm.sh/";
 const MAX_REDIRECTS: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct EsmLoader {
     client: deno_fetch::Client,
+    /// Bare specifiers the agent may import, mapped to their esm.sh URLs. Built
+    /// from the registered SDKs (see [`crate::sdk::allowed_imports`]).
+    allowed: HashMap<String, String>,
 }
 
 impl EsmLoader {
     pub fn new() -> Result<Self, anyhow::Error> {
         let client = deno_fetch::create_http_client("sdkmode/0.1.0", Default::default())?;
-        Ok(Self { client })
+        let allowed = crate::sdk::allowed_imports().into_iter().collect();
+        Ok(Self { client, allowed })
     }
 
     fn module_type(specifier: &ModuleSpecifier) -> ModuleType {
@@ -124,11 +129,37 @@ impl ModuleLoader for EsmLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        if specifier == OCTOKIT_SPECIFIER {
-            return ModuleSpecifier::parse(OCTOKIT_ESM_SH_URL).map_err(JsErrorBox::from_err);
+        // The agent's own module/script (e.g. file:///main.js) resolves to
+        // itself; its code is supplied directly, never fetched.
+        if let Ok(url) = ModuleSpecifier::parse(specifier) {
+            if url.scheme() == "file" {
+                return Ok(url);
+            }
         }
 
-        resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
+        // Once we are inside esm.sh, allow it to resolve its own dependency tree
+        // (other esm.sh URLs and data: URLs), but nothing off-host.
+        if referrer.starts_with(ESM_SH) {
+            let resolved = resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)?;
+            if resolved.as_str().starts_with(ESM_SH) || resolved.scheme() == "data" {
+                return Ok(resolved);
+            }
+            return Err(JsErrorBox::generic(format!(
+                "blocked transitive import to {resolved}"
+            )));
+        }
+
+        // Agent code may only import the bare specifiers registered by an SDK.
+        if let Some(url) = self.allowed.get(specifier) {
+            return ModuleSpecifier::parse(url).map_err(JsErrorBox::from_err);
+        }
+
+        let mut allowed: Vec<&str> = self.allowed.keys().map(String::as_str).collect();
+        allowed.sort();
+        Err(JsErrorBox::generic(format!(
+            "import not allowed: {specifier:?}. Only registered SDK packages may be imported: {}",
+            allowed.join(", ")
+        )))
     }
 
     fn load(

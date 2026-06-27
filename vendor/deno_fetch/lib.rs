@@ -531,7 +531,7 @@ pub fn op_fetch(
                     request_builder_hook
                         .hook(&mut request)
                         .await
-                        .map_err(FetchError::RequestBuilderHook);
+                        .map_err(FetchError::RequestBuilderHook)?;
                 }
 
                 client.send(request).map_err(Into::into).await
