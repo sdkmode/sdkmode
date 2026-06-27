@@ -1,3 +1,3 @@
 # sdkmode
 
- A MCP server that allows agents to run JS against real, securely authenticated SDKs.
+ A agent that allows LLMs to run JS against real, securely authenticated SDKs.
