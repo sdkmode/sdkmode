@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Allow the release job to create GitHub Releases.
+permissions:
+  contents: write
+
+jobs:
+  # Build one binary per platform and upload it as a workflow artifact.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest # Apple Silicon
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # aws-lc-sys (via rustls) needs nasm to build on x86_64 Linux.
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y nasm
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: |
+          asset="sdkmode-${{ github.ref_name }}-${{ matrix.target }}"
+          cp target/release/sdkmode "$asset"
+          strip "$asset"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: sdkmode-${{ github.ref_name }}-${{ matrix.target }}
+
+  # Generate the changelog and publish the release with both binaries attached.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git-cliff needs full history + tags to build the changelog.
+          fetch-depth: 0
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate changelog for this tag
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          # --latest: only this release's section (commits since the prior tag).
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.changelog.outputs.content }}
+          # Binaries (versioned names) + the installer (stable name, so
+          # /releases/latest/download/install.sh always resolves).
+          files: |
+            artifacts/*
+            install.sh
