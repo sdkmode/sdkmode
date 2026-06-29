@@ -1,3 +1,10 @@
 /target
 vendor/*/target/**/*
 .direnv
+
+# Python (benchmark.py tooling)
+.venv/
+__pycache__/
+
+# Scratch REPL captures
+output.txt
