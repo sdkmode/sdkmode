@@ -16,8 +16,9 @@
 use std::borrow::Cow;
 
 use reedline::{
-    DefaultHinter, FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, Signal,
+    DefaultHinter, EditCommand, Emacs, FileBackedHistory, KeyCode, KeyModifiers, Prompt,
+    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, Signal,
+    default_emacs_keybindings,
 };
 
 use crate::{llm, sandbox, transform};
@@ -88,7 +89,20 @@ impl Prompt for ReplPrompt {
 /// Build the line editor, wiring up file-backed history when a home directory is
 /// available so entries persist across sessions.
 fn build_editor() -> Reedline {
-    let editor = Reedline::create().with_hinter(Box::new(DefaultHinter::default()));
+    // Compose multi-line messages: insert a newline instead of submitting.
+    // Shift+Enter only reaches us in terminals that report it (Kitty keyboard
+    // protocol); Alt+Enter is the universal fallback. Enter still submits.
+    let mut keybindings = default_emacs_keybindings();
+    let newline = ReedlineEvent::Edit(vec![EditCommand::InsertNewline]);
+    keybindings.add_binding(KeyModifiers::SHIFT, KeyCode::Enter, newline.clone());
+    keybindings.add_binding(KeyModifiers::ALT, KeyCode::Enter, newline);
+
+    let editor = Reedline::create()
+        .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        // A pasted block is inserted as one multi-line edit, not submitted
+        // line-by-line.
+        .use_bracketed_paste(true)
+        .with_hinter(Box::new(DefaultHinter::default()));
 
     let Some(mut path) = dirs_home() else {
         return editor;
@@ -198,6 +212,9 @@ fn print_error(error: &str) {
 async fn handle_message(message: &str, entries: &mut Vec<Entry>, session: &mut sandbox::Session) {
     entries.push(Entry::User(message.to_string()));
 
+    let mut steps = 0usize;
+    let mut cost_usd = 0.0;
+
     for _ in 0..MAX_STEPS {
         let context = build_context(entries);
 
@@ -206,9 +223,11 @@ async fn handle_message(message: &str, entries: &mut Vec<Entry>, session: &mut s
         eprintln!();
         let mut block = crate::highlight::CodeBlock::new();
         let code = match llm::complete(&context, &mut block).await {
-            Ok(code) if !code.trim().is_empty() => {
+            Ok(completion) if !completion.code.trim().is_empty() => {
                 block.finish();
-                code
+                steps += 1;
+                cost_usd += completion.cost_usd;
+                completion.code
             }
             Ok(_) => {
                 block.finish();
@@ -248,13 +267,24 @@ async fn handle_message(message: &str, entries: &mut Vec<Entry>, session: &mut s
             eprintln!();
             crate::markdown::print_answer(&answer);
             entries.push(Entry::Answer(answer));
+            emit_metrics(steps, cost_usd);
             return;
         }
 
         // No return (and possibly an error to recover from): take another step.
     }
 
+    emit_metrics(steps, cost_usd);
     eprintln!("(the assistant did not return an answer after {MAX_STEPS} steps)");
+}
+
+/// When `SDKMODE_METRICS` is set, print a machine-readable metrics line on
+/// stderr at the end of a turn, for harnesses like benchmark.py to parse.
+fn emit_metrics(steps: usize, cost_usd: f64) {
+    if std::env::var_os("SDKMODE_METRICS").is_some() {
+        let metrics = serde_json::json!({ "steps": steps, "cost_usd": cost_usd });
+        eprintln!("__sdkmode_metrics {metrics}");
+    }
 }
 
 /// Run the REPL. Uses the reedline line editor when attached to a terminal, and
@@ -292,7 +322,10 @@ async fn run_interactive(
         "sdkmode — describe what you want in English; the assistant writes and runs JavaScript."
     );
     eprintln!(
-        "It may take several steps and answers by returning a value. State persists. Ctrl-D to exit.\n"
+        "It may take several steps and answers by returning a value. State persists."
+    );
+    eprintln!(
+        "Enter sends; Shift+Enter (or Alt+Enter) inserts a newline. Ctrl-D to exit.\n"
     );
 
     loop {
