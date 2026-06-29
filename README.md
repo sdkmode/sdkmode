@@ -13,10 +13,12 @@ curl -fsSL https://sh.sdkmo.de | sh
 ### Mac ・Homebrew
 
 <!-- TODO: homebrew -->
+Coming soon. 
 
 ### Windows
 
 <!-- TODO: windows -->
+Coming soon. 
 
 ## Usage
 
