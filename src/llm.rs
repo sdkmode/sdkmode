@@ -31,8 +31,11 @@ comments. Plain English on its own line is a syntax error.
 How a turn works:
 - Each reply is one step that runs immediately. You then see its output and may \
 write another step.
-- `console.log(...)` is your scratchpad: use it to inspect values and reason \
-across steps. It is shown to the user as working notes, not as your answer.
+- `console.log(...)` is your scratchpad. Only log when it is either (a) \
+intermediate state you need to read/parse yourself before deciding your next \
+step, or (b) something you must remember for a later step but will not show the \
+user. Otherwise do not log — and never log data you are about to `return` (that \
+just wastes tokens).
 - To answer the user, you MUST `return` a value (e.g. `return summary;`). \
 Returning ends the turn, shows that value to the user, and hands them control. \
 Format the returned string as Markdown.
@@ -58,16 +61,28 @@ processes, or reach private network hosts.
 /// Extra attempts if `claude` exits non-zero (transient cold-start failures).
 const RETRIES: usize = 1;
 
+/// One step's result: the extracted JavaScript and what the `claude` call cost.
+pub struct Completion {
+    pub code: String,
+    pub cost_usd: f64,
+}
+
 /// Ask `claude` for the next step's JavaScript, streaming its output to `sink`
-/// and returning the extracted source. Retries once on a transient failure.
-pub async fn complete(context: &str, sink: &mut dyn CodeSink) -> anyhow::Result<String> {
+/// and returning the extracted source plus the step's cost. Retries once on a
+/// transient failure.
+pub async fn complete(context: &str, sink: &mut dyn CodeSink) -> anyhow::Result<Completion> {
     let mut last_error = None;
     for attempt in 0..=RETRIES {
         if attempt > 0 {
             sink.on_retry();
         }
         match run_claude(context, sink).await {
-            Ok(text) => return Ok(extract_code(&text)),
+            Ok((text, cost_usd)) => {
+                return Ok(Completion {
+                    code: extract_code(&text),
+                    cost_usd,
+                });
+            }
             Err(error) => {
                 last_error = Some(error);
                 if attempt < RETRIES {
@@ -83,8 +98,8 @@ pub async fn complete(context: &str, sink: &mut dyn CodeSink) -> anyhow::Result<
 /// replaced by [`SYSTEM_PROMPT`], dynamic context (git status, env) and project
 /// settings (CLAUDE.md, MCP servers) are excluded, and every built-in tool is
 /// off — so it can only emit the next step's source. Streams text deltas to
-/// `sink` and returns the full concatenated output.
-async fn run_claude(context: &str, sink: &mut dyn CodeSink) -> anyhow::Result<String> {
+/// `sink` and returns the full concatenated output plus the run's reported cost.
+async fn run_claude(context: &str, sink: &mut dyn CodeSink) -> anyhow::Result<(String, f64)> {
     let mut child = Command::new("claude")
         .arg("-p")
         .arg("--output-format")
@@ -126,10 +141,13 @@ async fn run_claude(context: &str, sink: &mut dyn CodeSink) -> anyhow::Result<St
     let mut lines = BufReader::new(stdout).lines();
 
     let mut full = String::new();
+    let mut cost_usd = 0.0;
     while let Some(line) = lines.next_line().await? {
         if let Some(delta) = parse_text_delta(&line) {
             full.push_str(&delta);
             sink.on_delta(&delta);
+        } else if let Some(cost) = parse_result_cost(&line) {
+            cost_usd = cost;
         }
     }
 
@@ -138,7 +156,16 @@ async fn run_claude(context: &str, sink: &mut dyn CodeSink) -> anyhow::Result<St
         anyhow::bail!("`claude` exited with {status}");
     }
 
-    Ok(full)
+    Ok((full, cost_usd))
+}
+
+/// Pull `total_cost_usd` out of a `stream-json` `result` line, if present.
+fn parse_result_cost(line: &str) -> Option<f64> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "result" {
+        return None;
+    }
+    value.get("total_cost_usd")?.as_f64()
 }
 
 /// Pull the text out of a `stream-json` `content_block_delta` line, if that's
@@ -159,43 +186,75 @@ fn parse_text_delta(line: &str) -> Option<String> {
     Some(delta.get("text")?.as_str()?.to_string())
 }
 
-/// Turn `claude`'s reply into runnable source: strip any markdown fence, and if
-/// the result still doesn't parse, drop leading lines (a leaked prose preamble)
-/// until it does.
+/// Turn `claude`'s reply into runnable source, repairing the two ways the model
+/// leaks non-code: a markdown code fence (even with prose before it), and
+/// leading prose it forgot to mark as a `//` comment. In both cases the prose is
+/// preserved as `//` comments rather than deleted.
 fn extract_code(text: &str) -> String {
-    let stripped = strip_code_fences(text);
-    if crate::transform::is_parseable(&stripped) {
-        return stripped;
+    let candidate = fenced(text).unwrap_or_else(|| text.trim().to_string());
+
+    if crate::transform::is_parseable(&candidate) {
+        return candidate;
     }
 
-    let lines: Vec<&str> = stripped.lines().collect();
-    let limit = lines.len().min(6);
-    for start in 1..limit {
-        let candidate = lines[start..].join("\n");
-        if crate::transform::is_parseable(&candidate) {
-            return candidate.trim().to_string();
-        }
-    }
-
-    stripped
+    // Prose that wasn't fenced and isn't commented: comment the leading lines.
+    comment_leading_prose(&candidate)
 }
 
-/// Strip a single surrounding markdown code fence (```js … ```), if the model
-/// added one despite instructions. Leaves un-fenced text untouched.
-fn strip_code_fences(text: &str) -> String {
-    let trimmed = text.trim();
-    let Some(after_open) = trimmed.strip_prefix("```") else {
-        return trimmed.to_string();
+/// If the model wrapped its code in a ```…``` fence, return the fence's
+/// contents, with everything *before* the opening fence preserved as `//`
+/// comments. `None` when there is no fence; a missing closing fence is tolerated.
+fn fenced(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let open = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("```"))?;
+    let after_open = &lines[open + 1..];
+    let inner = match after_open
+        .iter()
+        .position(|line| line.trim_start().starts_with("```"))
+    {
+        Some(close) => &after_open[..close],
+        None => after_open,
     };
 
-    // Drop the rest of the opening fence line (e.g. "js" in "```js").
-    let body = after_open
-        .split_once('\n')
-        .map(|(_, rest)| rest)
-        .unwrap_or("");
-    let body = body.trim_end();
-    let body = body.strip_suffix("```").unwrap_or(body);
-    body.trim().to_string()
+    let mut out = String::new();
+    for line in &lines[..open] {
+        out.push_str(&comment_line(line));
+        out.push('\n');
+    }
+    out.push_str(inner.join("\n").trim());
+    Some(out.trim().to_string())
+}
+
+/// Find the smallest leading prefix such that the remaining lines parse, then
+/// comment that prefix out. Only triggers when there *is* parseable code below,
+/// so genuinely broken code still surfaces its error.
+fn comment_leading_prose(code: &str) -> String {
+    let lines: Vec<&str> = code.lines().collect();
+    let limit = lines.len().min(6);
+    for split in 1..limit {
+        if !crate::transform::is_parseable(&lines[split..].join("\n")) {
+            continue;
+        }
+        let mut out = String::new();
+        for line in &lines[..split] {
+            out.push_str(&comment_line(line));
+            out.push('\n');
+        }
+        out.push_str(&lines[split..].join("\n"));
+        return out.trim_end().to_string();
+    }
+    code.trim().to_string()
+}
+
+/// Prefix a line with `// `, unless it is blank or already a comment.
+fn comment_line(line: &str) -> String {
+    if line.trim().is_empty() || line.trim_start().starts_with("//") {
+        line.to_string()
+    } else {
+        format!("// {line}")
+    }
 }
 
 #[cfg(test)]
@@ -213,10 +272,30 @@ mod tests {
     }
 
     #[test]
-    fn drops_leaked_prose_preamble() {
-        assert_eq!(
-            extract_code("Here is the code:\nreturn 1 + 1;"),
-            "return 1 + 1;"
-        );
+    fn comments_leaked_prose_preamble() {
+        // Prose the model forgot to comment is preserved as a comment, not deleted.
+        let out = extract_code("Here is the code:\nreturn 1 + 1;");
+        assert_eq!(out, "// Here is the code:\nreturn 1 + 1;");
+        assert!(crate::transform::is_parseable(&out));
+    }
+
+    #[test]
+    fn recovers_prose_then_fenced_code() {
+        // The real failure: a prose sentence (with `'` and backticks) before a
+        // fenced code block. The fence isn't at the start, so the old stripper
+        // missed it. Now we pull out the fenced code and keep the pre-fence
+        // prose as a comment.
+        let input = "The workflow only triggers on `push`. I'll trigger it by creating an empty commit.\n\n```javascript\n// Get the current HEAD commit\nconst owner = \"sdkmode\";\nreturn `done ${owner}`;\n```";
+        let out = extract_code(input);
+        assert!(crate::transform::is_parseable(&out), "not parseable: {out}");
+        assert!(out.contains("// The workflow only triggers"), "prose not commented: {out}");
+        assert!(out.contains("const owner"), "code missing: {out}");
+    }
+
+    #[test]
+    fn leaves_broken_single_line_to_error() {
+        // Genuinely broken code (no parseable remainder) is not silently
+        // commented away — it's returned so the runtime surfaces the error.
+        assert_eq!(extract_code("const = = oops"), "const = = oops");
     }
 }
