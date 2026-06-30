@@ -37,6 +37,12 @@ pub(crate) fn allowed_imports() -> Vec<(String, String)> {
         // served as transpiled JS via esm.sh's JSR proxy. Built on `Deno.*`, so
         // it runs under the existing cwd permissions with no extra wiring.
         ("@std/fs".to_string(), "https://esm.sh/jsr/@std/fs".to_string()),
+        // Pure-JS git: the core package and its fetch-based http client.
+        ("isomorphic-git".to_string(), "https://esm.sh/isomorphic-git".to_string()),
+        (
+            "isomorphic-git/http/web".to_string(),
+            "https://esm.sh/isomorphic-git/http/web".to_string(),
+        ),
     ];
     for sdk in descriptors() {
         for package in sdk.packages() {
