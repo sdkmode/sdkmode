@@ -60,6 +60,14 @@ let prompt;
 //   const info = await git.getRemoteInfo({ http, url });                 // list refs
 //   await git.push({ fs, http, dir: ".", url });                         // auth is brokered — do
 //                                                                        // NOT pass onAuth
+
+// Browser automation: `browser` is always available — it lazily launches a
+// headless Chrome (host-side) and connects on first use. It is an Astral
+// browser; just use it. For example:
+//   const page = await browser.newPage("https://example.com");
+//   const title = await page.evaluate(() => document.title);   // run JS in the page
+//   const text = await page.evaluate(() => document.body.innerText);
+//   const html = await page.content();
 "#;
 
 /// One entry in the session transcript that is rendered back to the model.

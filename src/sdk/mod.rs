@@ -43,6 +43,10 @@ pub(crate) fn allowed_imports() -> Vec<(String, String)> {
             "isomorphic-git/http/web".to_string(),
             "https://esm.sh/isomorphic-git/http/web".to_string(),
         ),
+        // Browser automation: the Astral CDP client connects to a host-spawned
+        // Chrome (see `globalThis.browser`). Deno-native, so it loads cleanly
+        // where playwright-core does not.
+        ("@astral/astral".to_string(), "https://esm.sh/jsr/@astral/astral".to_string()),
     ];
     for sdk in descriptors() {
         for package in sdk.packages() {

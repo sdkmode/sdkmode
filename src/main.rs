@@ -1,3 +1,4 @@
+mod browser;
 mod esm_loader;
 mod extensions;
 pub(crate) mod fetch;
@@ -29,6 +30,9 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // Tear down the shared headless Chrome (if the agent ever launched one).
+    runtime.block_on(browser::shutdown());
 
     if let Err(error) = result {
         eprintln!("error: {}", error);

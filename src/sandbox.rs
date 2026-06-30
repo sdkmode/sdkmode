@@ -152,6 +152,41 @@ const FS_SHIM: &str = r#"
 })(globalThis);
 "#;
 
+/// Exposes `globalThis.browser`: an Astral browser that lazily connects to a
+/// host-spawned headless Chrome the first time it is used, then is reused for
+/// the rest of the session. A Proxy defers the (async) connect until an actual
+/// call or `await`, so guest code can write `await browser.newPage(url)` with no
+/// setup step — and Chrome is only launched if the agent actually browses.
+const BROWSER_SHIM: &str = r#"
+((globalThis) => {
+    // Captured before bootstrap (see [sdkmode:browser-op]); spawns the shared
+    // Chrome on first call and returns its CDP ws endpoint.
+    const chromeEndpoint = globalThis.__sdkmode_chromeEndpointOp;
+
+    let connecting = null;
+    const ready = () =>
+        (connecting ??= (async () => {
+            const { connect } = await import("@astral/astral");
+            return await connect({ endpoint: await chromeEndpoint() });
+        })());
+
+    globalThis.browser = new Proxy(function () {}, {
+        get(_target, prop) {
+            // `await browser` resolves to the real Browser.
+            if (prop === "then") {
+                return (onFulfilled, onRejected) => ready().then(onFulfilled, onRejected);
+            }
+            // Any other access connects if needed, then forwards to the Browser.
+            return (...args) =>
+                ready().then((browser) => {
+                    const value = browser[prop];
+                    return typeof value === "function" ? value.apply(browser, args) : value;
+                });
+        },
+    });
+})(globalThis);
+"#;
+
 /// Expression evaluated after the module finishes to retrieve captured output.
 const READ_OUTPUT: &str = "globalThis.__sdkmode_output.join('\\n')";
 
@@ -263,12 +298,17 @@ fn read_global_string(runtime: &mut deno_core::JsRuntime, expr: &'static str) ->
 /// console-[`CAPTURE_SHIM`] installed, ready to load modules or run scripts.
 fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
     let module_loader = std::rc::Rc::new(crate::esm_loader::EsmLoader::new()?);
+    // The snapshot bakes in the stock Deno extensions; our ops-only browser
+    // extension is appended at runtime (it has no JS to snapshot), so the
+    // snapshot set stays a prefix of the runtime set.
+    let mut extensions = extensions::extensions(Some(
+        deno_runtime::ops::bootstrap::SnapshotOptions::default(),
+    ));
+    extensions.push(crate::browser::sdkmode_browser::init());
     let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
         startup_snapshot: Some(RUNTIME_SNAPSHOT),
         module_loader: Some(module_loader),
-        extensions: extensions::extensions(Some(
-            deno_runtime::ops::bootstrap::SnapshotOptions::default(),
-        )),
+        extensions,
         ..Default::default()
     });
 
@@ -311,6 +351,16 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
         ),
         deno_bundle_runtime::deno_bundle_runtime::args(None),
     ])?;
+
+    // Stash the browser op while `Deno.core` is still exposed: deno_runtime's
+    // bootstrap (run next) removes `Deno.core` before any guest code executes,
+    // but a captured op reference keeps working afterward.
+    runtime
+        .execute_script(
+            "[sdkmode:browser-op]",
+            "globalThis.__sdkmode_chromeEndpointOp = Deno.core.ops.op_sdkmode_chrome_endpoint;",
+        )
+        .map_err(|error| anyhow::anyhow!("failed to capture browser op: {}", error))?;
 
     {
         let state = runtime.op_state();
@@ -358,6 +408,10 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
     runtime
         .execute_script("[sdkmode:fs]", FS_SHIM)
         .map_err(|error| anyhow::anyhow!("failed to install fs shim: {}", error))?;
+
+    runtime
+        .execute_script("[sdkmode:browser]", BROWSER_SHIM)
+        .map_err(|error| anyhow::anyhow!("failed to install browser shim: {}", error))?;
 
     Ok(runtime)
 }
@@ -541,15 +595,21 @@ mod tests {
         let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut session = Session::new().await.expect("session");
 
-        // Reading environment variables is denied.
+        // Environment variables are hidden: reads return undefined rather than
+        // the real value (and without throwing), so secrets stay unreachable
+        // while packages that probe env at import still load.
         let env = session
             .eval(crate::transform::wrap_turn("Deno.env.get('PATH')"))
             .await
             .unwrap();
         assert!(
-            env.error.is_some(),
-            "env access should be denied (output={:?})",
-            env.output
+            env.error.is_none(),
+            "env read should not throw: {:?}",
+            env.error
+        );
+        assert_eq!(
+            env.output, "undefined",
+            "env must appear empty, never expose the real PATH"
         );
 
         // Reading files outside the working directory is denied.

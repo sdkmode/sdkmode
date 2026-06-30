@@ -57,10 +57,13 @@ latest message) are always provided. Do not redeclare or re-import them.
 the working directory, but cannot access environment variables, spawn \
 processes, or reach private network hosts.
 - Imports are bare specifiers (never URLs) from a small allowlist: \
-`@octokit/rest` (GitHub API), `@std/fs` (Deno file helpers), and `isomorphic-git` \
+`@octokit/rest` (GitHub API), `@std/fs` (Deno file helpers), `isomorphic-git` \
 plus `isomorphic-git/http/web` (pure-JS git — a `fs` global wired to the working \
-directory is provided, so `git.log`/`git.statusMatrix` work on `dir: \".\"`). Do \
-not import anything else.";
+directory is provided, so `git.log`/`git.statusMatrix` work on `dir: \".\"`), and \
+`@astral/astral` (browser automation). Do not import anything else.
+- `browser` is always provided: an Astral browser that lazily launches a \
+headless Chrome on first use. Use it directly, e.g. `const page = await \
+browser.newPage(url); await page.evaluate(() => document.title)`.";
 
 /// Extra attempts if `claude` exits non-zero (transient cold-start failures).
 const RETRIES: usize = 1;
