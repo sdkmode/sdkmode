@@ -25,17 +25,34 @@ impl RequestBuilder for RequestInterceptor {
     ) -> Pin<Box<dyn Future<Output = Result<(), JsErrorBox>> + Send + 'a>> {
         Box::pin(async move {
             let host = request.uri().host().map(str::to_string);
+            let path = request.uri().path();
 
-            // Find a registered SDK whose host matches this request.
-            let mut sdk = None;
+            // Git smart-HTTP lives on the web host (e.g. `github.com`) rather than
+            // the API host (`api.github.com`), and authenticates with Basic, not
+            // Bearer. We broker it by pairing the web host with whichever SDK owns
+            // the `api.<host>` API host, but only on the well-known git endpoints —
+            // a bare web fetch to the host never receives credentials.
+            let is_git_smart_http = path.ends_with("/info/refs")
+                || path.ends_with("/git-upload-pack")
+                || path.ends_with("/git-receive-pack");
+            let git_api_host = host.as_deref().map(|h| format!("api.{h}"));
+
+            // Find a registered SDK matching this request: directly on its API
+            // host, or (for git requests) on the paired `api.<host>` host.
+            let mut matched: Option<(Arc<Mutex<dyn crate::sdk::Sdk>>, bool)> = None;
             for candidate in &self.sdks {
-                if candidate.lock().await.url().host_str() == host.as_deref() {
-                    sdk = Some(candidate.clone());
+                let api_host = candidate.lock().await.url().host_str().map(str::to_string);
+                if api_host.as_deref() == host.as_deref() {
+                    matched = Some((candidate.clone(), false));
+                    break;
+                }
+                if is_git_smart_http && api_host.as_deref() == git_api_host.as_deref() {
+                    matched = Some((candidate.clone(), true));
                     break;
                 }
             }
 
-            let Some(sdk) = sdk else {
+            let Some((sdk, is_git)) = matched else {
                 // Not a registered SDK: this is general web access. We inject no
                 // credentials, but block requests to the host's own loopback,
                 // private, and link-local ranges (SSRF / cloud metadata).
@@ -54,12 +71,26 @@ impl RequestBuilder for RequestInterceptor {
                 sdk.auth().await?;
             }
 
+            // For git smart-HTTP, present the SDK's token as HTTP Basic (token as
+            // the password) instead of the API's Bearer scheme.
+            let auth = match (is_git, sdk.auth_header()) {
+                (true, Some(bearer)) => {
+                    use base64::Engine;
+                    let token = bearer.strip_prefix("Bearer ").unwrap_or(&bearer).trim();
+                    let creds = base64::engine::general_purpose::STANDARD
+                        .encode(format!("x-access-token:{token}"));
+                    Some(format!("Basic {creds}"))
+                }
+                (false, header) => header,
+                (true, None) => None,
+            };
+
             let headers = request.headers_mut();
 
             headers.remove(http::header::AUTHORIZATION);
             headers.remove(http::header::COOKIE);
 
-            if let Some(auth_header) = sdk.auth_header() {
+            if let Some(auth_header) = auth {
                 headers.insert(
                     http::header::AUTHORIZATION,
                     auth_header
@@ -68,19 +99,21 @@ impl RequestBuilder for RequestInterceptor {
                 );
             }
 
-            if let Some(cookies) = sdk.cookies() {
-                if !cookies.is_empty() {
-                    let cookie_str = cookies
-                        .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    headers.insert(
-                        http::header::COOKIE,
-                        cookie_str
-                            .parse::<http::HeaderValue>()
-                            .or_else(|e| Err(JsErrorBox::generic(e.to_string())))?,
-                    );
+            if !is_git {
+                if let Some(cookies) = sdk.cookies() {
+                    if !cookies.is_empty() {
+                        let cookie_str = cookies
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        headers.insert(
+                            http::header::COOKIE,
+                            cookie_str
+                                .parse::<http::HeaderValue>()
+                                .or_else(|e| Err(JsErrorBox::generic(e.to_string())))?,
+                        );
+                    }
                 }
             }
 

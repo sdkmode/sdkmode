@@ -56,7 +56,10 @@ let prompt;
 //   const commits = await git.log({ fs, dir: ".", depth: 5 });           // recent history
 //   const status = await git.statusMatrix({ fs, dir: "." });             // working-tree status
 //   import http from "isomorphic-git/http/web";                          // remote repos
-//   const info = await git.getRemoteInfo({ http, url });                 // public; brokered fetch
+//   const url = "https://github.com/<owner>/<repo>.git";                 // https, not git@ SSH
+//   const info = await git.getRemoteInfo({ http, url });                 // list refs
+//   await git.push({ fs, http, dir: ".", url });                         // auth is brokered — do
+//                                                                        // NOT pass onAuth
 "#;
 
 /// One entry in the session transcript that is rendered back to the model.
