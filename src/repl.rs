@@ -46,6 +46,17 @@ let prompt;
 //   for await (const f of expandGlob("src/**/*.rs")) { /* f.path */ }   // find files
 //   const text = await Deno.readTextFile("Cargo.toml");                 // read
 //   await Deno.writeTextFile("path", text);                            // write / edit
+
+// Local git runs via isomorphic-git, with a ready `fs` global wired to the
+// working directory (there is NO shell — Deno.Command/child_process are
+// blocked, so "git status" is `git.statusMatrix`, not a command). Import the
+// bare specifier, never a URL. For example:
+//   import git from "isomorphic-git";
+//   const branch = await git.currentBranch({ fs, dir: "." });
+//   const commits = await git.log({ fs, dir: ".", depth: 5 });           // recent history
+//   const status = await git.statusMatrix({ fs, dir: "." });             // working-tree status
+//   import http from "isomorphic-git/http/web";                          // remote repos
+//   const info = await git.getRemoteInfo({ http, url });                 // public; brokered fetch
 "#;
 
 /// One entry in the session transcript that is rendered back to the model.

@@ -56,7 +56,11 @@ latest message) are always provided. Do not redeclare or re-import them.
 - A sandboxed Deno runtime; top-level await is allowed. You may read files in \
 the working directory, but cannot access environment variables, spawn \
 processes, or reach private network hosts.
-- `@octokit/rest` is the only package you may import. Do not import anything else.";
+- Imports are bare specifiers (never URLs) from a small allowlist: \
+`@octokit/rest` (GitHub API), `@std/fs` (Deno file helpers), and `isomorphic-git` \
+plus `isomorphic-git/http/web` (pure-JS git — a `fs` global wired to the working \
+directory is provided, so `git.log`/`git.statusMatrix` work on `dir: \".\"`). Do \
+not import anything else.";
 
 /// Extra attempts if `claude` exits non-zero (transient cold-start failures).
 const RETRIES: usize = 1;
