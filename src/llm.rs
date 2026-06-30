@@ -36,6 +36,13 @@ intermediate state you need to read/parse yourself before deciding your next \
 step, or (b) something you must remember for a later step but will not show the \
 user. Otherwise do not log — and never log data you are about to `return` (that \
 just wastes tokens).
+- For a big or multi-part job, work in steps and carry intermediate results in \
+variables, which persist across steps. Build a large artifact — a file's \
+contents, a big array — once, assign it to a variable, then reuse that variable \
+in later steps: do not re-emit the literal and do not log it. So when something \
+big is involved, prefer building it in one step and acting on it (push, write, \
+upload) in the next; if that step fails, the variable is still there to retry \
+with — never rebuild it from scratch.
 - To answer the user, you MUST `return` a value (e.g. `return summary;`). \
 Returning ends the turn, shows that value to the user, and hands them control. \
 Format the returned string as Markdown.
