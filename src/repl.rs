@@ -35,6 +35,17 @@ const SEED: &str = r#"import { Octokit } from "@octokit/rest";
 // Think in // comments and console.log(). Return a value to answer the user.
 const octokit = new Octokit();
 let prompt;
+
+// octokit is authenticated as the current user. For "you" / "your" / "my",
+// get the identity from GitHub — never guess from an email. For example:
+//   const me = (await octokit.rest.users.getAuthenticated()).data.login; // your real username
+
+// For local files, use the Deno std library and Deno globals (node:fs is NOT
+// available). For example:
+//   import { walk, expandGlob } from "@std/fs";
+//   for await (const f of expandGlob("src/**/*.rs")) { /* f.path */ }   // find files
+//   const text = await Deno.readTextFile("Cargo.toml");                 // read
+//   await Deno.writeTextFile("path", text);                            // write / edit
 "#;
 
 /// One entry in the session transcript that is rendered back to the model.
