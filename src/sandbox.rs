@@ -187,6 +187,27 @@ const BROWSER_SHIM: &str = r#"
 })(globalThis);
 "#;
 
+/// Scopes each turn's network work to a per-turn `AbortController` (exposed as
+/// `globalThis.__sdkmode_abort`) by attaching its signal to every `fetch`. When
+/// a turn returns or throws, [`Session::eval`] aborts the controller so the
+/// abandoned requests — e.g. the un-awaited siblings of a rejected
+/// `Promise.all` — are cancelled instead of running on into later turns (wasting
+/// time and bleeding their output into the wrong scratchpad). WebSocket work
+/// (the persistent browser) does not go through fetch, so it is unaffected.
+const ABORT_SHIM: &str = r#"
+((globalThis) => {
+    globalThis.__sdkmode_abort ??= new AbortController();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (input, init) => {
+        const ctrl = globalThis.__sdkmode_abort;
+        if (!ctrl) return realFetch(input, init);
+        const opts = { ...(init ?? {}) };
+        if (opts.signal == null) opts.signal = ctrl.signal;
+        return realFetch(input, opts);
+    };
+})(globalThis);
+"#;
+
 /// Expression evaluated after the module finishes to retrieve captured output.
 const READ_OUTPUT: &str = "globalThis.__sdkmode_output.join('\\n')";
 
@@ -413,6 +434,10 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
         .execute_script("[sdkmode:browser]", BROWSER_SHIM)
         .map_err(|error| anyhow::anyhow!("failed to install browser shim: {}", error))?;
 
+    runtime
+        .execute_script("[sdkmode:abort]", ABORT_SHIM)
+        .map_err(|error| anyhow::anyhow!("failed to install abort shim: {}", error))?;
+
     Ok(runtime)
 }
 
@@ -493,7 +518,8 @@ impl Session {
         self.runtime
             .execute_script(
                 "[sdkmode:reset]",
-                "globalThis.__sdkmode_output.length = 0; \
+                "globalThis.__sdkmode_abort ??= new AbortController(); \
+                 globalThis.__sdkmode_output.length = 0; \
                  globalThis.__sdkmode_returned = false; \
                  globalThis.__sdkmode_value = undefined;",
             )
@@ -523,6 +549,18 @@ impl Session {
         ) == "1";
         let value =
             returned.then(|| read_global_string(&mut self.runtime, "globalThis.__sdkmode_value"));
+
+        // A turn that returned (the agent is done) or threw (it failed) abandons
+        // any still-pending requests; abort them so they neither run on into the
+        // next turn nor bleed output into it. A clean step that merely continues
+        // keeps its controller, so intentionally deferred work survives.
+        if returned || error.is_some() {
+            let _ = self.runtime.execute_script(
+                "[sdkmode:abort-turn]",
+                "if (globalThis.__sdkmode_abort) { globalThis.__sdkmode_abort.abort(); \
+                 globalThis.__sdkmode_abort = null; }",
+            );
+        }
 
         Ok(StepResult {
             output,
@@ -567,6 +605,50 @@ mod tests {
         assert_eq!(second.output, "42");
         // A bare expression is scratchpad, not an answer.
         assert_eq!(second.value, None);
+    }
+
+    #[tokio::test]
+    async fn finished_turn_cancels_pending_work_but_continues_do_not() {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut session = Session::new().await.expect("session");
+
+        // A turn captures its abort controller and returns. Because it returned,
+        // the next turn must see that controller aborted (so requests left in
+        // flight are cancelled, not run on) with a fresh controller in place.
+        let first = session
+            .eval(crate::transform::wrap_turn(
+                "globalThis.__c = globalThis.__sdkmode_abort; return 'done';",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.value.as_deref(), Some("done"));
+
+        let second = session
+            .eval(crate::transform::wrap_turn(
+                "return String(globalThis.__c.signal.aborted) + ',' \
+                 + String(globalThis.__c !== globalThis.__sdkmode_abort);",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.value.as_deref(), Some("true,true"));
+
+        // A clean step that merely continues (no return) keeps its controller,
+        // so a fetch it intentionally deferred to a later step is not cancelled.
+        let third = session
+            .eval(crate::transform::wrap_turn(
+                "globalThis.__d = globalThis.__sdkmode_abort; console.log('continue');",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(third.value, None);
+
+        let fourth = session
+            .eval(crate::transform::wrap_turn(
+                "return String(globalThis.__d.signal.aborted);",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fourth.value.as_deref(), Some("false"));
     }
 
     #[tokio::test]
