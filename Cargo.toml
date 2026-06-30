@@ -5,6 +5,7 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
+base64 = "0.22"
 deno_cache = "0.177.0"
 deno_ast = "0.53.1"
 deno_core = "0.397.0"
