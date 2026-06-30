@@ -35,6 +35,39 @@ const CAPTURE_SHIM: &str = r#"
 })(globalThis);
 "#;
 
+/// Present an *empty* environment to guest code instead of letting env reads
+/// throw. The sandbox denies all real env access so secrets stay hidden, but
+/// many npm packages probe `process.env`/`Deno.env` at import time; under a hard
+/// deny that throws `NotCapable` and the whole module fails to load. Replacing
+/// `Deno.env` with stubs that return nothing keeps every real var unreachable
+/// while letting those harmless probes resolve to `undefined`. (`process.env`
+/// in the node-compat layer reads through `Deno.env`, so this covers it too.)
+const ENV_SHIM: &str = r#"
+((globalThis) => {
+    const empty = {
+        get: () => undefined,
+        has: () => false,
+        set: () => {},
+        delete: () => {},
+        toObject: () => ({}),
+    };
+    try {
+        Object.defineProperty(globalThis.Deno, "env", {
+            value: empty,
+            writable: false,
+            configurable: false,
+        });
+    } catch (_) {
+        const existing = globalThis.Deno && globalThis.Deno.env;
+        if (existing) {
+            existing.get = empty.get;
+            existing.has = empty.has;
+            existing.toObject = empty.toObject;
+        }
+    }
+})(globalThis);
+"#;
+
 /// Expression evaluated after the module finishes to retrieve captured output.
 const READ_OUTPUT: &str = "globalThis.__sdkmode_output.join('\\n')";
 
@@ -233,6 +266,10 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
     runtime
         .execute_script("[sdkmode:capture]", CAPTURE_SHIM)
         .map_err(|error| anyhow::anyhow!("failed to install capture shim: {}", error))?;
+
+    runtime
+        .execute_script("[sdkmode:env]", ENV_SHIM)
+        .map_err(|error| anyhow::anyhow!("failed to install env shim: {}", error))?;
 
     Ok(runtime)
 }
