@@ -29,10 +29,15 @@ fn descriptors() -> Vec<Box<dyn Sdk>> {
     vec![Box::new(github::GitHub::new())]
 }
 
-/// The allowlist of bare import specifiers mapped to their esm.sh URLs, gathered
-/// from every registered SDK.
+/// The allowlist of bare import specifiers mapped to their URLs: the standard
+/// tooling packages plus every registered SDK's npm package (from esm.sh).
 pub(crate) fn allowed_imports() -> Vec<(String, String)> {
-    let mut imports = Vec::new();
+    let mut imports = vec![
+        // Deno std filesystem helpers (walk, expandGlob, …) for local file work,
+        // served as transpiled JS via esm.sh's JSR proxy. Built on `Deno.*`, so
+        // it runs under the existing cwd permissions with no extra wiring.
+        ("@std/fs".to_string(), "https://esm.sh/jsr/@std/fs".to_string()),
+    ];
     for sdk in descriptors() {
         for package in sdk.packages() {
             imports.push(((*package).to_string(), format!("https://esm.sh/{package}")));
