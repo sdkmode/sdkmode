@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use deno_runtime::{
     deno_permissions::PermissionsContainer, permissions::RuntimePermissionDescriptorParser,
@@ -8,6 +10,99 @@ use crate::extensions;
 use crate::fetch::fetch_options;
 
 static RUNTIME_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/RUNJS_SNAPSHOT.bin"));
+
+/// Wall-clock cap on a single guest execution (one [`Session::eval`] step or one
+/// [`execute_code`] module). Guest code runs V8 synchronously on the single
+/// tokio thread, so a synchronous infinite loop (`while (true) {}`) never yields
+/// and no `tokio::select!` (e.g. the REPL's SIGINT handler) can ever fire. A
+/// watchdog thread calls `terminate_execution` on the isolate once this elapses,
+/// unwinding the guest so the step returns an error instead of hanging forever.
+///
+/// Overridable at runtime via `SDKMODE_STEP_TIMEOUT_MS` (milliseconds) — handy
+/// for tests that want a short deadline, and as a production escape hatch.
+const STEP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Resolve the effective step timeout, honouring the `SDKMODE_STEP_TIMEOUT_MS`
+/// override when it is set to a valid non-zero value.
+fn step_timeout() -> Duration {
+    match std::env::var("SDKMODE_STEP_TIMEOUT_MS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => STEP_TIMEOUT,
+        },
+        Err(_) => STEP_TIMEOUT,
+    }
+}
+
+/// The message a terminated step reports, so the model (or MCP client) sees a
+/// readable reason rather than V8's bare "execution terminated".
+fn timeout_error_message(timeout: Duration) -> String {
+    format!(
+        "the step was terminated: it ran past the {}s limit (an infinite loop or a hang)",
+        timeout.as_secs_f64()
+    )
+}
+
+/// A running watchdog that terminates the isolate if the guest overruns.
+///
+/// Spawns a `std::thread` that waits on a channel with a timeout: if the main
+/// path sends (or drops the sender) before the deadline, the guest finished and
+/// the isolate is left untouched; if the deadline passes first, it calls
+/// `terminate_execution` on the thread-safe [`v8::IsolateHandle`], which unwinds
+/// the pending synchronous or event-loop work with an uncatchable termination.
+struct ExecutionWatchdog {
+    /// Sending (or dropping) this cancels the watchdog before it can fire.
+    cancel: Option<mpsc::Sender<()>>,
+    /// Set to `true` by the watchdog thread iff it actually terminated the
+    /// isolate, so the caller can map the resulting error to a clear message.
+    fired: Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ExecutionWatchdog {
+    /// Arm a watchdog for `timeout` against `handle` (obtained from
+    /// `runtime.v8_isolate().thread_safe_handle()`, which is `Send`).
+    fn arm(handle: deno_core::v8::IsolateHandle, timeout: Duration) -> Self {
+        let (cancel, rx) = mpsc::channel::<()>();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_thread = fired.clone();
+        let join = std::thread::spawn(move || {
+            // Woken early (recv/disconnect) => guest finished, do nothing.
+            // Timed out => terminate the still-running guest.
+            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
+                fired_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+                handle.terminate_execution();
+            }
+        });
+        Self {
+            cancel: Some(cancel),
+            fired,
+            join: Some(join),
+        }
+    }
+
+    /// Whether the watchdog terminated the isolate (as opposed to the guest
+    /// finishing on its own). Only meaningful after [`Self::disarm`].
+    fn fired(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Cancel the watchdog (if it hasn't fired) and join its thread.
+    fn disarm(&mut self) {
+        // Dropping the sender wakes `recv_timeout` immediately if it is still
+        // waiting; if the watchdog already fired this is a no-op.
+        self.cancel.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for ExecutionWatchdog {
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
 
 /// JavaScript installed before the user's module runs. It redirects the
 /// `console` methods into a buffer on `globalThis` so the output can be read
@@ -467,9 +562,21 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
 /// its captured `console` output and any error it raised. Each call gets an
 /// isolated runtime, so state does not leak between executions. Used by the MCP
 /// server; the REPL uses [`Session`] for persistent state.
+///
+/// A watchdog enforces [`STEP_TIMEOUT`]: if the module runs past it (e.g. a
+/// synchronous infinite loop that never yields the tokio thread), V8 execution
+/// is force-terminated and the returned error reports the timeout, so the MCP
+/// server cannot hang forever.
 pub async fn execute_code(code: String) -> Result<ExecutionResult, anyhow::Error> {
     let mut runtime = build_runtime()?;
     let specifier = deno_core::ModuleSpecifier::parse("file:///main.js")?;
+
+    // Guard the whole load + event-loop drive: a synchronous infinite loop in
+    // the module never yields the tokio thread, so without this the MCP server
+    // would hang forever (Bug 1 / Bug 4).
+    let timeout = step_timeout();
+    let handle = runtime.v8_isolate().thread_safe_handle();
+    let mut watchdog = ExecutionWatchdog::arm(handle, timeout);
 
     let mut error = None;
     match runtime
@@ -487,6 +594,14 @@ pub async fn execute_code(code: String) -> Result<ExecutionResult, anyhow::Error
         Err(load_error) => {
             error = Some(load_error.to_string());
         }
+    }
+
+    watchdog.disarm();
+    if watchdog.fired() {
+        // V8 was force-terminated; clear the terminating state so the output
+        // read below is not itself terminated, then replace V8's opaque wording.
+        runtime.v8_isolate().cancel_terminate_execution();
+        error = Some(timeout_error_message(timeout));
     }
 
     let output = read_global_string(&mut runtime, READ_OUTPUT);
@@ -534,7 +649,20 @@ impl Session {
     /// against the persistent global scope. Returns the captured scratchpad
     /// output, any error, and the value the step `return`ed. State assigned to
     /// `globalThis` survives into the next call.
+    ///
+    /// A watchdog enforces [`STEP_TIMEOUT`]: a step that runs past it (e.g. a
+    /// synchronous `while (true) {}` that never yields, so the REPL's SIGINT
+    /// `select!` can never fire) has its V8 execution force-terminated and
+    /// surfaces as a timeout error. The isolate is left usable for the next
+    /// step (any lingering terminating state is cleared here and defensively at
+    /// the start of the following `eval`).
     pub async fn eval(&mut self, code: String) -> Result<StepResult, anyhow::Error> {
+        // Defensive: if a previous step was force-terminated by the watchdog,
+        // the isolate can stay in a "terminating" state that would poison this
+        // step's very first script. Clearing it here makes the session reliably
+        // usable again after a timeout.
+        self.runtime.v8_isolate().cancel_terminate_execution();
+
         // Start each step with an empty scratchpad and cleared return slots, so
         // a prior step's answer can't leak if this one fails to compile.
         self.runtime
@@ -546,6 +674,13 @@ impl Session {
                  globalThis.__sdkmode_value = undefined;",
             )
             .map_err(|error| anyhow::anyhow!("failed to reset session state: {error}"))?;
+
+        // Guard the synchronous `execute_script` and the async event-loop drive:
+        // a `while (true) {}` in the turn never yields, so the watchdog is the
+        // only thing that can stop it and let the step return an error.
+        let timeout = step_timeout();
+        let handle = self.runtime.v8_isolate().thread_safe_handle();
+        let mut watchdog = ExecutionWatchdog::arm(handle, timeout);
 
         let mut error = None;
         match self.runtime.execute_script("[sdkmode:turn]", code) {
@@ -575,6 +710,16 @@ impl Session {
             Err(execute_error) => {
                 error = Some(execute_error.to_string());
             }
+        }
+
+        watchdog.disarm();
+        if watchdog.fired() {
+            // The watchdog force-terminated V8. Clear the terminating state now
+            // so the output/return reads below (each a small `execute_script`)
+            // don't themselves get terminated, and report the timeout rather
+            // than V8's opaque wording.
+            self.runtime.v8_isolate().cancel_terminate_execution();
+            error = Some(timeout_error_message(timeout));
         }
 
         let output = read_global_string(&mut self.runtime, READ_OUTPUT);
@@ -774,5 +919,61 @@ mod tests {
             .await
             .unwrap();
         assert!(import.error.is_some(), "unlisted import should be rejected");
+    }
+
+    #[tokio::test]
+    async fn infinite_sync_loop_times_out_and_session_survives() {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut session = Session::new().await.expect("session");
+
+        // Drive the watchdog with a short deadline so the test finishes in a
+        // couple of seconds instead of the 120s production default. The override
+        // is read at eval time; scope it to this call and restore it afterwards
+        // so parallel tests keep the production timeout. Session::new (above)
+        // runs before we set it, so its TLS/import work is never capped short.
+        //
+        // SAFETY: set_var/remove_var are unsafe (they mutate process-global env
+        // and can race with concurrent getenv). This is test-only and the window
+        // is brief; other tests do not touch this key.
+        unsafe {
+            std::env::set_var("SDKMODE_STEP_TIMEOUT_MS", "1500");
+        }
+
+        // A synchronous infinite loop never yields the tokio thread; only the
+        // isolate-termination watchdog can stop it. Time the call to prove it
+        // returns promptly (well under the 120s prod default) rather than hanging.
+        let started = std::time::Instant::now();
+        let looped = session
+            .eval(crate::transform::wrap_turn("while (true) {}"))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        unsafe {
+            std::env::remove_var("SDKMODE_STEP_TIMEOUT_MS");
+        }
+
+        let message = looped.error.expect("infinite loop should error");
+        assert!(
+            message.contains("terminated") && message.contains("limit"),
+            "expected a timeout error, got: {message}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "timeout should fire promptly, took {elapsed:?}"
+        );
+
+        // The isolate must be usable again after a forced termination: the next
+        // step runs normally and can return an answer.
+        let alive = session
+            .eval(crate::transform::wrap_turn("return 'alive';"))
+            .await
+            .unwrap();
+        assert!(
+            alive.error.is_none(),
+            "session should recover after a timeout: {:?}",
+            alive.error
+        );
+        assert_eq!(alive.value.as_deref(), Some("alive"));
     }
 }
