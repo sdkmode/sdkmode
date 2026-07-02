@@ -36,9 +36,15 @@ pub(crate) fn allowed_imports() -> Vec<(String, String)> {
         // Deno std filesystem helpers (walk, expandGlob, …) for local file work,
         // served as transpiled JS via esm.sh's JSR proxy. Built on `Deno.*`, so
         // it runs under the existing cwd permissions with no extra wiring.
-        ("@std/fs".to_string(), "https://esm.sh/jsr/@std/fs".to_string()),
+        (
+            "@std/fs".to_string(),
+            "https://esm.sh/jsr/@std/fs".to_string(),
+        ),
         // Pure-JS git: the core package and its fetch-based http client.
-        ("isomorphic-git".to_string(), "https://esm.sh/isomorphic-git".to_string()),
+        (
+            "isomorphic-git".to_string(),
+            "https://esm.sh/isomorphic-git".to_string(),
+        ),
         (
             "isomorphic-git/http/web".to_string(),
             "https://esm.sh/isomorphic-git/http/web".to_string(),
@@ -46,7 +52,10 @@ pub(crate) fn allowed_imports() -> Vec<(String, String)> {
         // Browser automation: the Astral CDP client connects to a host-spawned
         // Chrome (see `globalThis.browser`). Deno-native, so it loads cleanly
         // where playwright-core does not.
-        ("@astral/astral".to_string(), "https://esm.sh/jsr/@astral/astral".to_string()),
+        (
+            "@astral/astral".to_string(),
+            "https://esm.sh/jsr/@astral/astral".to_string(),
+        ),
     ];
     for sdk in descriptors() {
         for package in sdk.packages() {
@@ -54,4 +63,57 @@ pub(crate) fn allowed_imports() -> Vec<(String, String)> {
         }
     }
     imports
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the "register each SDK in both `registry()` and `descriptors()`"
+    /// invariant. The broker authenticates from `registry()` while the import
+    /// allowlist is built from `descriptors()`; if the two lists drift, agent
+    /// code can import an SDK that never gets credentials, or vice versa.
+    #[tokio::test]
+    async fn registry_and_descriptors_describe_the_same_sdks() {
+        let registry = registry();
+        let descriptors = descriptors();
+        assert_eq!(
+            registry.len(),
+            descriptors.len(),
+            "registry() and descriptors() differ in length; register each SDK in both"
+        );
+
+        let mut live_meta = Vec::new();
+        for sdk in &registry {
+            let sdk = sdk.lock().await;
+            live_meta.push((sdk.url().to_string(), sdk.packages().to_vec()));
+        }
+        live_meta.sort();
+
+        let mut descriptor_meta: Vec<_> = descriptors
+            .iter()
+            .map(|sdk| (sdk.url().to_string(), sdk.packages().to_vec()))
+            .collect();
+        descriptor_meta.sort();
+
+        assert_eq!(
+            live_meta, descriptor_meta,
+            "registry() and descriptors() describe different SDKs; keep them in sync"
+        );
+    }
+
+    /// Every SDK's declared packages must appear in the import allowlist, or
+    /// agent code could never import the very SDK the broker authenticates.
+    #[test]
+    fn allowed_imports_cover_every_sdk_package() {
+        let imports = allowed_imports();
+        for descriptor in descriptors() {
+            for package in descriptor.packages() {
+                assert!(
+                    imports.iter().any(|(spec, _url)| spec == package),
+                    "SDK package {package:?} is missing from allowed_imports()"
+                );
+            }
+        }
+    }
 }
