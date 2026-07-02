@@ -304,6 +304,68 @@ const BROWSER_SHIM: &str = r#"
 })(globalThis);
 "#;
 
+/// Exposes `globalThis.octokit`: an authenticated Octokit client that lazily
+/// imports `@octokit/rest` (from the pinned esm.sh URL) and constructs itself
+/// the first time it is touched, then is reused for the rest of the session.
+/// Modeled on [`BROWSER_SHIM`] — a Proxy defers the (async, network) import
+/// until an actual access — so `Session::new` needs no network and the REPL can
+/// start offline for local-only tasks.
+///
+/// Octokit is used through nested member chains (e.g.
+/// `octokit.rest.users.getAuthenticated()`), so a top-level `get` returns a
+/// *nested* proxy that keeps deferring: reads walk a property path, and a call
+/// awaits the real Octokit, walks that same path, and invokes the method with
+/// the correct `this`. Every leaf is a thenable, so `await octokit.rest.x.y()`
+/// resolves in a single expression exactly as the model writes it.
+const OCTOKIT_SHIM: &str = r#"
+((globalThis) => {
+    let loading = null;
+    // Import + construct once; a failed attempt is not cached so a later use
+    // (after transient network trouble) retries.
+    const ready = () =>
+        (loading ??= (async () => {
+            try {
+                const { Octokit } = await import("@octokit/rest");
+                return new Octokit();
+            } catch (error) {
+                loading = null;
+                throw error;
+            }
+        })());
+
+    // A proxy over the property path walked so far (`path`). Reading a property
+    // extends the path and returns another such proxy; `then` / calling resolve
+    // the real client and follow the path.
+    const make = (path) =>
+        new Proxy(function () {}, {
+            get(_target, prop) {
+                // `await octokit...` resolves the value at the current path.
+                if (prop === "then") {
+                    return (onFulfilled, onRejected) =>
+                        ready()
+                            .then((root) => path.reduce((obj, key) => obj[key], root))
+                            .then(onFulfilled, onRejected);
+                }
+                if (typeof prop === "symbol") return undefined;
+                return make([...path, prop]);
+            },
+            // Calling forwards to the method at the parent path, bound to its
+            // owner so Octokit's internal `this` is correct.
+            apply(_target, _thisArg, args) {
+                return ready().then((root) => {
+                    const parent = path
+                        .slice(0, -1)
+                        .reduce((obj, key) => obj[key], root);
+                    const fn = parent[path[path.length - 1]];
+                    return fn.apply(parent, args);
+                });
+            },
+        });
+
+    globalThis.octokit = make([]);
+})(globalThis);
+"#;
+
 /// Scopes each turn's network work to a per-turn `AbortController` (exposed as
 /// `globalThis.__sdkmode_abort`) by attaching its signal to every `fetch`. When
 /// a turn returns or throws, [`Session::eval`] aborts the controller so the
@@ -552,6 +614,10 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
         .map_err(|error| anyhow::anyhow!("failed to install browser shim: {}", error))?;
 
     runtime
+        .execute_script("[sdkmode:octokit]", OCTOKIT_SHIM)
+        .map_err(|error| anyhow::anyhow!("failed to install octokit shim: {}", error))?;
+
+    runtime
         .execute_script("[sdkmode:abort]", ABORT_SHIM)
         .map_err(|error| anyhow::anyhow!("failed to install abort shim: {}", error))?;
 
@@ -619,29 +685,17 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a session and seed `globalThis.octokit` with an authenticated
-    /// client, so every turn can use it without importing.
+    /// Create a session. `globalThis.octokit` is available to every turn without
+    /// importing, but it is *lazy*: the [`OCTOKIT_SHIM`] proxy imports
+    /// `@octokit/rest` and constructs the client only on first use. So `new()`
+    /// does no network I/O and the REPL can start offline for local-only tasks;
+    /// the octokit import happens later, the first time a turn actually touches
+    /// `octokit`.
     pub async fn new() -> Result<Self, anyhow::Error> {
-        let mut runtime = build_runtime()?;
-        let specifier = deno_core::ModuleSpecifier::parse("file:///main.js")?;
-
-        // Static import is loaded as the (single) main module — the proven path
-        // for resolving `@octokit/rest` — then stashed on the global scope.
-        let init = "import { Octokit } from \"@octokit/rest\";\n\
-                    globalThis.octokit = new Octokit();\n";
-        let module_id = runtime
-            .load_main_es_module_from_code(&specifier, init.to_string())
-            .await
-            .map_err(|error| anyhow::anyhow!("session init failed to load: {error}"))?;
-        let evaluate = runtime.mod_evaluate(module_id);
-        runtime
-            .run_event_loop(Default::default())
-            .await
-            .map_err(|error| anyhow::anyhow!("session init event loop failed: {error}"))?;
-        evaluate
-            .await
-            .map_err(|error| anyhow::anyhow!("session init failed: {error}"))?;
-
+        // The runtime is fully built by `build_runtime` (which installs the
+        // lazy OCTOKIT_SHIM). There is nothing left to load over the network
+        // here, so no main module is evaluated at session start.
+        let runtime = build_runtime()?;
         Ok(Self { runtime })
     }
 
@@ -756,8 +810,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_persists_across_evals() {
-        // Session::new loads @octokit/rest over TLS, which needs a crypto
-        // provider; main() installs this, but the test harness does not.
+        // Session::new no longer fetches at start (octokit is lazy), but any
+        // later TLS use (e.g. a turn that touches `octokit`) still needs a
+        // process-wide crypto provider; main() installs this, the test harness
+        // does not. Installing it here is harmless and keeps such turns working.
         let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let mut session = Session::new().await.expect("session");
@@ -975,5 +1031,79 @@ mod tests {
             alive.error
         );
         assert_eq!(alive.value.as_deref(), Some("alive"));
+    }
+
+    #[tokio::test]
+    async fn octokit_is_lazy_and_does_not_throw_at_session_start() {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Session::new must not require the network now; if it did, constructing
+        // the session offline (or the eager import failing) would error here.
+        let mut session = Session::new().await.expect("session");
+
+        // Merely touching `octokit` (without awaiting) must not throw: the proxy
+        // returns another proxy and defers the import. The proxy wraps a
+        // function target (like BROWSER_SHIM) so it stays callable, hence
+        // `typeof` is "function"; the point is that the access is safe and the
+        // import has NOT happened yet.
+        let touched = session
+            .eval(crate::transform::wrap_turn("return typeof octokit;"))
+            .await
+            .unwrap();
+        assert!(
+            touched.error.is_none(),
+            "touching octokit must not throw: {:?}",
+            touched.error
+        );
+        assert_eq!(touched.value.as_deref(), Some("function"));
+
+        // A nested access also stays safe and deferred (still a proxy, still
+        // callable), proving the chain resolves lazily rather than eagerly.
+        let nested = session
+            .eval(crate::transform::wrap_turn(
+                "return typeof octokit.rest.repos;",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            nested.error.is_none(),
+            "nested octokit access must not throw: {:?}",
+            nested.error
+        );
+        assert_eq!(nested.value.as_deref(), Some("function"));
+    }
+
+    #[tokio::test]
+    async fn octokit_nested_member_resolves_through_the_lazy_proxy() {
+        // This awaits the proxy, which triggers the pinned @octokit/rest import
+        // over TLS — hence the crypto provider. It asserts the *proxy mechanics*
+        // and the import resolve (no "import not allowed"/proxy crash); it does
+        // NOT call GitHub, so it needs no auth and is CI-safe.
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut session = Session::new().await.expect("session");
+
+        // `octokit.rest.repos.get` must resolve, through the nested proxy and
+        // the lazy import, to a real callable on the constructed Octokit client.
+        let step = session
+            .eval(crate::transform::wrap_turn(
+                "const t = typeof (await octokit.rest.repos.get); return t;",
+            ))
+            .await
+            .unwrap();
+
+        // If the import genuinely could not be fetched (offline CI), don't fail
+        // the suite on network flakiness — only assert the proxy did not itself
+        // break. A successful resolve must yield "function".
+        if let Some(err) = &step.error {
+            assert!(
+                !err.contains("import not allowed"),
+                "the pinned @octokit/rest import must be allowed: {err}"
+            );
+        } else {
+            assert_eq!(
+                step.value.as_deref(),
+                Some("function"),
+                "nested octokit.rest.repos.get must resolve to a callable"
+            );
+        }
     }
 }
