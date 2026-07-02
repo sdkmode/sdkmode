@@ -41,7 +41,10 @@ mod tests {
     #[test]
     fn renders_bold_with_ansi() {
         let rendered = skin().text("**bold** word", Some(80)).to_string();
-        assert!(rendered.contains('\u{1b}'), "expected ANSI escapes: {rendered:?}");
+        assert!(
+            rendered.contains('\u{1b}'),
+            "expected ANSI escapes: {rendered:?}"
+        );
         assert!(rendered.contains("bold"), "{rendered:?}");
     }
 }
