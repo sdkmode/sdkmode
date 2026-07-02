@@ -29,8 +29,20 @@ fn descriptors() -> Vec<Box<dyn Sdk>> {
     vec![Box::new(github::GitHub::new())]
 }
 
+/// esm.sh version pin for the one SDK package (`@octokit/rest`). Kept next to
+/// the other pins below; see the module-level note on bumping these.
+const OCTOKIT_REST_VERSION: &str = "22.0.1";
+
 /// The allowlist of bare import specifiers mapped to their URLs: the standard
 /// tooling packages plus every registered SDK's npm package (from esm.sh).
+///
+/// Every esm.sh URL here is pinned to an explicit version deliberately, for
+/// supply-chain reproducibility: an unpinned specifier floats to whatever
+/// esm.sh serves today, so a fresh process could silently pull different code
+/// (and the persistent disk cache in `esm_loader` relies on these URLs being
+/// immutable). To bump a pin, resolve the new version from esm.sh — e.g.
+/// `curl -fsSLI https://esm.sh/<pkg>` and read the `x-esm-path` header — then
+/// verify the pinned URL returns 200 before committing.
 pub(crate) fn allowed_imports() -> Vec<(String, String)> {
     let mut imports = vec![
         // Deno std filesystem helpers (walk, expandGlob, …) for local file work,
@@ -38,28 +50,42 @@ pub(crate) fn allowed_imports() -> Vec<(String, String)> {
         // it runs under the existing cwd permissions with no extra wiring.
         (
             "@std/fs".to_string(),
-            "https://esm.sh/jsr/@std/fs".to_string(),
+            "https://esm.sh/jsr/@std/fs@1.0.24".to_string(),
         ),
-        // Pure-JS git: the core package and its fetch-based http client.
+        // Pure-JS git: the core package and its fetch-based http client. Both are
+        // pinned to the same isomorphic-git version so they stay compatible.
         (
             "isomorphic-git".to_string(),
-            "https://esm.sh/isomorphic-git".to_string(),
+            "https://esm.sh/isomorphic-git@1.38.6".to_string(),
         ),
         (
             "isomorphic-git/http/web".to_string(),
-            "https://esm.sh/isomorphic-git/http/web".to_string(),
+            "https://esm.sh/isomorphic-git@1.38.6/http/web".to_string(),
         ),
         // Browser automation: the Astral CDP client connects to a host-spawned
         // Chrome (see `globalThis.browser`). Deno-native, so it loads cleanly
         // where playwright-core does not.
         (
             "@astral/astral".to_string(),
-            "https://esm.sh/jsr/@astral/astral".to_string(),
+            "https://esm.sh/jsr/@astral/astral@0.5.6".to_string(),
         ),
     ];
     for sdk in descriptors() {
         for package in sdk.packages() {
-            imports.push(((*package).to_string(), format!("https://esm.sh/{package}")));
+            // The KEY stays the bare specifier the agent imports (so the
+            // drift-guard tests still match `packages()` against these keys);
+            // only the URL value carries the version pin. There is a single SDK
+            // package (`@octokit/rest`), so a direct pin lookup suffices.
+            let url = match *package {
+                "@octokit/rest" => {
+                    format!("https://esm.sh/@octokit/rest@{OCTOKIT_REST_VERSION}")
+                }
+                // A newly registered SDK package must be pinned above too; until
+                // then it falls back to the unpinned URL (and CI's drift guards
+                // still force it into this allowlist).
+                other => format!("https://esm.sh/{other}"),
+            };
+            imports.push(((*package).to_string(), url));
         }
     }
     imports
