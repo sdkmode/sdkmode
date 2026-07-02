@@ -40,18 +40,17 @@ pub async fn endpoint() -> anyhow::Result<String> {
 /// Kill the shared browser if it is running and remove its profile. Statics are
 /// not dropped at exit, so without this the headless Chrome would be orphaned.
 pub async fn shutdown() {
-    if let Some(cell) = CHROME.get() {
-        if let Some(mut chrome) = cell.lock().await.take() {
-            let _ = chrome.child.kill().await;
-            let _ = std::fs::remove_dir_all(&chrome.user_data_dir);
-        }
+    if let Some(cell) = CHROME.get()
+        && let Some(mut chrome) = cell.lock().await.take()
+    {
+        let _ = chrome.child.kill().await;
+        let _ = std::fs::remove_dir_all(&chrome.user_data_dir);
     }
 }
 
 async fn launch() -> anyhow::Result<Chrome> {
     let binary = find_chrome()?;
-    let user_data_dir =
-        std::env::temp_dir().join(format!("sdkmode-chrome-{}", std::process::id()));
+    let user_data_dir = std::env::temp_dir().join(format!("sdkmode-chrome-{}", std::process::id()));
     std::fs::create_dir_all(&user_data_dir)?;
     let active_port = user_data_dir.join("DevToolsActivePort");
     let _ = std::fs::remove_file(&active_port);

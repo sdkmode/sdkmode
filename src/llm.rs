@@ -309,7 +309,10 @@ mod tests {
         let input = "The workflow only triggers on `push`. I'll trigger it by creating an empty commit.\n\n```javascript\n// Get the current HEAD commit\nconst owner = \"sdkmode\";\nreturn `done ${owner}`;\n```";
         let out = extract_code(input);
         assert!(crate::transform::is_parseable(&out), "not parseable: {out}");
-        assert!(out.contains("// The workflow only triggers"), "prose not commented: {out}");
+        assert!(
+            out.contains("// The workflow only triggers"),
+            "prose not commented: {out}"
+        );
         assert!(out.contains("const owner"), "code missing: {out}");
     }
 

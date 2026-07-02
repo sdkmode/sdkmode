@@ -42,24 +42,22 @@ pub fn is_parseable(code: &str) -> bool {
 /// Parse and transform the step body, returning (body, globalThis-assign).
 fn build_body(code: &str) -> (String, String) {
     // First parse as a module: supports `import` and ordinary declarations.
-    if let Some(parsed) = parse(code) {
-        if let ProgramRef::Module(module) = parsed.program_ref() {
-            return transform_module(module, &parsed);
-        }
+    if let Some(parsed) = parse(code)
+        && let ProgramRef::Module(module) = parsed.program_ref()
+    {
+        return transform_module(module, &parsed);
     }
 
     // Retry wrapped in a function so a top-level `return` (how the agent answers)
     // is syntactically legal. Static imports are not valid here, but the agent is
     // told to use dynamic import instead.
     let wrapped = format!("async function __sdkmode_wrap() {{\n{code}\n}}");
-    if let Some(parsed) = parse(&wrapped) {
-        if let ProgramRef::Module(module) = parsed.program_ref() {
-            if let Some(ModuleItem::Stmt(Stmt::Decl(Decl::Fn(func)))) = module.body.first() {
-                if let Some(block) = &func.function.body {
-                    return transform_stmts(&block.stmts, &parsed);
-                }
-            }
-        }
+    if let Some(parsed) = parse(&wrapped)
+        && let ProgramRef::Module(module) = parsed.program_ref()
+        && let Some(ModuleItem::Stmt(Stmt::Decl(Decl::Fn(func)))) = module.body.first()
+        && let Some(block) = &func.function.body
+    {
+        return transform_stmts(&block.stmts, &parsed);
     }
 
     // Unparseable: run verbatim so the runtime surfaces the syntax error.
@@ -174,7 +172,9 @@ globalThis.__sdkmode_returned = true;
 globalThis.__sdkmode_value = (typeof __sdkmode_result === "string") ? __sdkmode_result : (() => { try { return JSON.stringify(__sdkmode_result); } catch (_e) { return String(__sdkmode_result); } })();
 }
 })();"#;
-    TEMPLATE.replace("__BODY__", body).replace("__ASSIGN__", assign)
+    TEMPLATE
+        .replace("__BODY__", body)
+        .replace("__ASSIGN__", assign)
 }
 
 fn parse(code: &str) -> Option<ParsedSource> {
@@ -256,7 +256,9 @@ fn import_to_dynamic(import: &ImportDecl, names: &mut Vec<String>) -> String {
                 let local = spec.local.sym.to_string();
                 let imported = match &spec.imported {
                     Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
-                    Some(ModuleExportName::Str(string)) => js_string(&string.value.to_string_lossy()),
+                    Some(ModuleExportName::Str(string)) => {
+                        js_string(&string.value.to_string_lossy())
+                    }
                     None => local.clone(),
                 };
                 names.push(local.clone());
@@ -270,7 +272,10 @@ fn import_to_dynamic(import: &ImportDecl, names: &mut Vec<String>) -> String {
     }
 
     if !named.is_empty() {
-        out.push_str(&format!("var {{ {} }} = await import({src});\n", named.join(", ")));
+        out.push_str(&format!(
+            "var {{ {} }} = await import({src});\n",
+            named.join(", ")
+        ));
     }
 
     out
@@ -302,7 +307,10 @@ mod tests {
     fn persists_destructured_and_function_names() {
         let out = wrap_turn("const { a, b: c } = obj;\nfunction greet() {}");
         assert!(out.contains("var { a, b: c } = obj;"), "{out}");
-        assert!(out.contains("Object.assign(globalThis, { a, c, greet });"), "{out}");
+        assert!(
+            out.contains("Object.assign(globalThis, { a, c, greet });"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -310,14 +318,20 @@ mod tests {
         let out = wrap_turn("const total = 42;\nreturn total;");
         assert!(out.contains("var total = 42;"), "{out}");
         assert!(out.contains("return total;"), "{out}");
-        assert!(out.contains("Object.assign(globalThis, { total });"), "{out}");
+        assert!(
+            out.contains("Object.assign(globalThis, { total });"),
+            "{out}"
+        );
     }
 
     #[test]
     fn converts_static_import_to_dynamic() {
         let out = wrap_turn("import { Octokit } from \"@octokit/rest\";");
         assert!(out.contains("await import(\"@octokit/rest\")"), "{out}");
-        assert!(out.contains("Object.assign(globalThis, { Octokit });"), "{out}");
+        assert!(
+            out.contains("Object.assign(globalThis, { Octokit });"),
+            "{out}"
+        );
     }
 
     #[test]
