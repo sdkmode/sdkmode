@@ -80,11 +80,7 @@ async fn handle_message(message: &Value) -> Option<Value> {
         "tools/list" => Some(success(id, json!({ "tools": [tool_schema()] }))),
         "tools/call" => Some(handle_tool_call(id, message.get("params")).await),
         "ping" => Some(success(id, json!({}))),
-        _ if is_request(&id) => Some(error(
-            id,
-            -32601,
-            &format!("Method not found: {method}"),
-        )),
+        _ if is_request(&id) => Some(error(id, -32601, &format!("Method not found: {method}"))),
         // Notifications (e.g. notifications/initialized) get no response.
         _ => None,
     }
@@ -127,9 +123,7 @@ async fn handle_tool_call(id: Option<Value>, params: Option<&Value>) -> Value {
             }
             tool_result(id, text, is_error)
         }
-        Err(sandbox_error) => {
-            tool_result(id, format!("sandbox error: {sandbox_error}"), true)
-        }
+        Err(sandbox_error) => tool_result(id, format!("sandbox error: {sandbox_error}"), true),
     }
 }
 
@@ -137,10 +131,13 @@ fn tool_schema() -> Value {
     json!({
         "name": TOOL_NAME,
         "description": "Execute JavaScript in a sandboxed Deno runtime and return its captured \
-console output. The code runs as an ES module, so top-level `await` and `import` are supported; \
-npm packages are loaded on demand from esm.sh (for example `import { Octokit } from \
-\"@octokit/rest\"`). Requests to supported SDKs (e.g. the GitHub API) are transparently \
-authenticated by the host. Use console.log to surface results.",
+    console output. The code runs as an ES module, so top-level `await` and `import` are supported. \
+    Imports are restricted to a fixed allowlist of bare specifiers (not arbitrary npm): \
+    `@octokit/rest` (authenticated GitHub API), `@std/fs`, `isomorphic-git` plus \
+    `isomorphic-git/http/web`, and `@astral/astral` — e.g. `import { Octokit } from \"@octokit/rest\"`. \
+    Requests to supported SDKs (e.g. the GitHub API) are transparently authenticated by the host. \
+    The sandbox may read/write the working directory but cannot access env vars, spawn processes, or \
+    reach private network hosts. Use console.log to surface results.",
         "inputSchema": {
             "type": "object",
             "properties": {
