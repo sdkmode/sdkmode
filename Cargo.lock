@@ -6671,7 +6671,6 @@ dependencies = [
  "deno_ffi",
  "deno_fs",
  "deno_http",
- "deno_image",
  "deno_io",
  "deno_kv",
  "deno_napi",
