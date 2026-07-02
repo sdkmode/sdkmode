@@ -17,8 +17,8 @@ use std::borrow::Cow;
 
 use reedline::{
     DefaultHinter, EditCommand, Emacs, FileBackedHistory, KeyCode, KeyModifiers, Prompt,
-    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, Signal,
-    default_emacs_keybindings,
+    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent,
+    Signal, default_emacs_keybindings,
 };
 
 use crate::{llm, sandbox, transform};
@@ -277,7 +277,18 @@ async fn handle_message(message: &str, entries: &mut Vec<Entry>, session: &mut s
         let result = match session.eval(build_executable(message, &code)).await {
             Ok(result) => result,
             Err(sandbox_error) => {
-                eprintln!("sandbox error: {sandbox_error}");
+                let error = format!("sandbox error: {sandbox_error}");
+                print_error(&error);
+                // Record the failed step so the model's context stays consistent
+                // with what actually happened: without this, the next turn would
+                // see its last code as if it had never run (empty output, no
+                // error), and could not react. Mirror the guest-JS error path
+                // (which records `result.error`) with an empty scratchpad.
+                entries.push(Entry::Step {
+                    code,
+                    output: String::new(),
+                    error: Some(error),
+                });
                 return;
             }
         };
@@ -354,12 +365,8 @@ async fn run_interactive(
     eprintln!(
         "sdkmode — describe what you want in English; the assistant writes and runs JavaScript."
     );
-    eprintln!(
-        "It may take several steps and answers by returning a value. State persists."
-    );
-    eprintln!(
-        "Enter sends; Shift+Enter (or Alt+Enter) inserts a newline. Ctrl-D to exit.\n"
-    );
+    eprintln!("It may take several steps and answers by returning a value. State persists.");
+    eprintln!("Enter sends; Shift+Enter (or Alt+Enter) inserts a newline. Ctrl-D to exit.\n");
 
     loop {
         match editor.read_line(&prompt) {
