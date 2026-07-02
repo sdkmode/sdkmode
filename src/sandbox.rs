@@ -166,8 +166,30 @@ const BROWSER_SHIM: &str = r#"
     let connecting = null;
     const ready = () =>
         (connecting ??= (async () => {
-            const { connect } = await import("@astral/astral");
-            return await connect({ endpoint: await chromeEndpoint() });
+            try {
+                const { connect } = await import("@astral/astral");
+                const endpoint = await chromeEndpoint();
+                // Astral's connect never rejects if the ws fails to open (it
+                // only listens for onopen), which would hang the turn with no
+                // pending ops. Race a deadline so failure becomes an error.
+                let timer;
+                const deadline = new Promise((_, reject) => {
+                    timer = setTimeout(
+                        () => reject(new Error("browser: could not connect to Chrome within 15s")),
+                        15000,
+                    );
+                });
+                try {
+                    return await Promise.race([connect({ endpoint }), deadline]);
+                } finally {
+                    clearTimeout(timer);
+                }
+            } catch (error) {
+                // Do not cache a failed connect: the next browser use retries
+                // (Chrome may have been slow to start, or was since killed).
+                connecting = null;
+                throw error;
+            }
         })());
 
     globalThis.browser = new Proxy(function () {}, {
@@ -534,7 +556,20 @@ impl Session {
                     .with_event_loop_promise(resolve, deno_core::PollEventLoopOptions::default())
                     .await
                 {
-                    error = Some(event_loop_error.to_string());
+                    let message = event_loop_error.to_string();
+                    // deno_core's wording for "an await stalled with nothing to
+                    // drive it" is cryptic; spell out what happened and that the
+                    // step's bindings were not saved (the turn was abandoned
+                    // before its finally-lift could run).
+                    error = Some(if message.contains("event loop has already resolved") {
+                        "the step stalled: it awaited a promise nothing will ever \
+                         resolve (e.g. a connection that failed without an error \
+                         handler), so it was abandoned; its declarations were NOT \
+                         saved — redeclare anything you need"
+                            .to_string()
+                    } else {
+                        message
+                    });
                 }
             }
             Err(execute_error) => {
@@ -605,6 +640,34 @@ mod tests {
         assert_eq!(second.output, "42");
         // A bare expression is scratchpad, not an answer.
         assert_eq!(second.value, None);
+    }
+
+    #[tokio::test]
+    async fn stalled_step_reports_a_readable_error_and_the_session_survives() {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut session = Session::new().await.expect("session");
+
+        // A promise nothing will ever resolve (no pending ops back it): the
+        // event loop idles and the turn is abandoned. That must surface as a
+        // readable error, not deno_core's cryptic wording.
+        let stalled = session
+            .eval(crate::transform::wrap_turn(
+                "const before = 1; await new Promise(() => {}); const after = 2;",
+            ))
+            .await
+            .unwrap();
+        let message = stalled.error.expect("stalled step should error");
+        assert!(
+            message.contains("the step stalled"),
+            "expected mapped stall error, got: {message}"
+        );
+
+        // The session must remain usable afterwards.
+        let next = session
+            .eval(crate::transform::wrap_turn("return 'alive';"))
+            .await
+            .unwrap();
+        assert_eq!(next.value.as_deref(), Some("alive"));
     }
 
     #[tokio::test]
