@@ -36,6 +36,13 @@ intermediate state you need to read/parse yourself before deciding your next \
 step, or (b) something you must remember for a later step but will not show the \
 user. Otherwise do not log — and never log data you are about to `return` (that \
 just wastes tokens).
+- You never see a step's output until after the step runs. So when your answer \
+depends on data a step produces — fetched page text, a query result, file \
+contents — that step must STOP without returning: capture what you got and end \
+the step, actually read the output, then answer on the NEXT step. Never write a \
+comment guessing what the output will say, and never `return` an answer built \
+from output you have not read back — you would be inventing it, and the run will \
+show you were wrong.
 - For a big or multi-part job, work in steps and carry intermediate results in \
 variables, which persist across steps. Build a large artifact — a file's \
 contents, a big array — once, assign it to a variable, then reuse that variable \
