@@ -430,11 +430,14 @@ async def main() -> None:
             except Exception as error:
                 print(f"{task_name} / {trial_name} ({i + 1}/{args.repeats}): setup failed: {error}")
                 return
+            # Bound up front so a runner exception can't leave them undefined
+            # and raise NameError below (which would abort the whole gather).
+            result = {"answer": "", "cost": None, "duration_s": 0.0, "error": True}
+            correct = False
             try:
                 prompt = task.prompt.format(**ctx) if ctx else task.prompt
                 cwd = task.cwd(ctx) if task.cwd else None
                 result = await runner(prompt, cwd)
-                correct = False
                 if not result["error"]:
                     try:
                         if task.check:
@@ -444,6 +447,8 @@ async def main() -> None:
                             correct = verify(result["answer"], truth, task.kind)
                     except Exception:
                         correct = False  # verification failed; can't credit it
+            except Exception as error:
+                print(f"{task_name} / {trial_name} ({i + 1}/{args.repeats}): run failed: {error}")
             finally:
                 if task.teardown:
                     try:
