@@ -8,6 +8,8 @@ use deno_core::ModuleSpecifier;
 use deno_core::ModuleType;
 use deno_core::ResolutionKind;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use deno_core::error::ModuleLoaderError;
 use deno_core::resolve_import;
@@ -19,19 +21,41 @@ use http_body_util::BodyExt;
 const ESM_SH: &str = "https://esm.sh/";
 const MAX_REDIRECTS: usize = 10;
 
+/// A remote module we've already fetched: the final specifier after following
+/// redirects, plus its source. Keyed in the cache by the *requested* module URL.
+#[derive(Clone, Debug)]
+struct CachedModule {
+    found_specifier: ModuleSpecifier,
+    code: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct EsmLoader {
     client: deno_fetch::Client,
     /// Bare specifiers the agent may import, mapped to their esm.sh URLs. Built
     /// from the registered SDKs (see [`crate::sdk::allowed_imports`]).
     allowed: HashMap<String, String>,
+    /// Per-process cache of fetched modules, keyed by the requested module URL.
+    /// It exists because every process start otherwise re-downloads the whole
+    /// octokit dependency graph from esm.sh, and in MCP mode a fresh runtime is
+    /// built per call — without this each of those runtimes would refetch every
+    /// module. Shared across `.clone()`s (see `load`) via `Arc<Mutex<_>>` so a
+    /// given resolved URL is fetched at most once.
+    cache: Arc<Mutex<HashMap<String, CachedModule>>>,
 }
 
 impl EsmLoader {
     pub fn new() -> Result<Self, anyhow::Error> {
-        let client = deno_fetch::create_http_client("sdkmode/0.1.0", Default::default())?;
+        let client = deno_fetch::create_http_client(
+            concat!("sdkmode/", env!("CARGO_PKG_VERSION")),
+            Default::default(),
+        )?;
         let allowed = crate::sdk::allowed_imports().into_iter().collect();
-        Ok(Self { client, allowed })
+        Ok(Self {
+            client,
+            allowed,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     fn module_type(specifier: &ModuleSpecifier) -> ModuleType {
@@ -46,7 +70,37 @@ impl EsmLoader {
         &self,
         requested_specifier: ModuleSpecifier,
     ) -> Result<ModuleSource, ModuleLoaderError> {
-        let (found_specifier, code) = self.fetch_with_redirects(requested_specifier.clone()).await?;
+        let key = requested_specifier.as_str().to_string();
+
+        // Serve repeats without network. The lock is held only for this quick
+        // read; if it's a miss we drop it before touching the network.
+        let cached = self
+            .cache
+            .lock()
+            .expect("esm module cache mutex poisoned")
+            .get(&key)
+            .cloned();
+
+        let (found_specifier, code) = match cached {
+            Some(entry) => (entry.found_specifier, entry.code),
+            None => {
+                // Fetch first (no lock held across the await), then insert.
+                let (found_specifier, code) = self
+                    .fetch_with_redirects(requested_specifier.clone())
+                    .await?;
+                self.cache
+                    .lock()
+                    .expect("esm module cache mutex poisoned")
+                    .insert(
+                        key,
+                        CachedModule {
+                            found_specifier: found_specifier.clone(),
+                            code: code.clone(),
+                        },
+                    );
+                (found_specifier, code)
+            }
+        };
 
         Ok(ModuleSource::new_with_redirect(
             Self::module_type(&found_specifier),
@@ -70,7 +124,9 @@ impl EsmLoader {
                 let location = response
                     .headers()
                     .get(LOCATION)
-                    .ok_or_else(|| JsErrorBox::generic("redirect response missing location header"))?
+                    .ok_or_else(|| {
+                        JsErrorBox::generic("redirect response missing location header")
+                    })?
                     .to_str()
                     .map_err(|error| JsErrorBox::generic(error.to_string()))?;
 
@@ -118,7 +174,11 @@ impl EsmLoader {
             .body(deno_fetch::ReqBody::empty())
             .map_err(|error| JsErrorBox::generic(error.to_string()))?;
 
-        self.client.clone().send(request).await.map_err(JsErrorBox::from_err)
+        self.client
+            .clone()
+            .send(request)
+            .await
+            .map_err(JsErrorBox::from_err)
     }
 }
 
@@ -131,10 +191,10 @@ impl ModuleLoader for EsmLoader {
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
         // The agent's own module/script (e.g. file:///main.js) resolves to
         // itself; its code is supplied directly, never fetched.
-        if let Ok(url) = ModuleSpecifier::parse(specifier) {
-            if url.scheme() == "file" {
-                return Ok(url);
-            }
+        if let Ok(url) = ModuleSpecifier::parse(specifier)
+            && url.scheme() == "file"
+        {
+            return Ok(url);
         }
 
         // Once we are inside esm.sh, allow it to resolve its own dependency tree
@@ -171,6 +231,46 @@ impl ModuleLoader for EsmLoader {
         let loader = self.clone();
         let module_specifier = module_specifier.clone();
 
-        ModuleLoadResponse::Async(Box::pin(async move { loader.load_remote(module_specifier).await }))
+        ModuleLoadResponse::Async(Box::pin(async move {
+            loader.load_remote(module_specifier).await
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Building the HTTP client (in `new()`) needs a process-wide rustls
+    // CryptoProvider; install one so this test can construct a loader. The
+    // cache field is what we're actually exercising here.
+    fn test_loader() -> EsmLoader {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        EsmLoader::new().expect("loader")
+    }
+
+    #[test]
+    fn cache_is_shared_across_clones() {
+        let loader = test_loader();
+        let clone = loader.clone();
+
+        let key = "https://esm.sh/example@1.0.0/mod.js";
+        let entry = CachedModule {
+            found_specifier: ModuleSpecifier::parse(key).unwrap(),
+            code: "export const x = 1;".to_string(),
+        };
+
+        // Insert via one clone's handle...
+        clone
+            .cache
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), entry.clone());
+
+        // ...and observe it through the original: the Arc<Mutex<_>> is shared.
+        let seen = loader.cache.lock().unwrap().get(key).cloned();
+        let seen = seen.expect("entry visible through the other clone");
+        assert_eq!(seen.code, entry.code);
+        assert_eq!(seen.found_specifier, entry.found_specifier);
     }
 }
