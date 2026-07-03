@@ -163,209 +163,6 @@ const ENV_SHIM: &str = r#"
 })(globalThis);
 "#;
 
-/// A minimal node-`fs`-shaped filesystem backed by `Deno.*`, exposed to guest
-/// code as `globalThis.fs`. isomorphic-git takes an `fs` argument for every
-/// working-tree/`.git` operation, but `node:fs` is not available in the sandbox;
-/// this adapts the Deno APIs (which already run under the cwd read/write
-/// permissions). Errors are remapped to node `errno` codes (ENOENT, EEXIST, …)
-/// because isomorphic-git branches on `err.code` to detect missing refs/objects.
-const FS_SHIM: &str = r#"
-((globalThis) => {
-    const mapErr = (e) => {
-        if (e instanceof Deno.errors.NotFound) e.code = "ENOENT";
-        else if (e instanceof Deno.errors.AlreadyExists) e.code = "EEXIST";
-        else if (e instanceof Deno.errors.PermissionDenied) e.code = "EACCES";
-        else if (e instanceof Deno.errors.NotADirectory) e.code = "ENOTDIR";
-        else if (e instanceof Deno.errors.IsADirectory) e.code = "EISDIR";
-        return e;
-    };
-    const toBytes = (data) =>
-        typeof data === "string" ? new TextEncoder().encode(data)
-        : data instanceof Uint8Array ? data
-        : new Uint8Array(data);
-    const toStats = (info) => ({
-        isFile: () => info.isFile,
-        isDirectory: () => info.isDirectory,
-        isSymbolicLink: () => info.isSymlink,
-        size: info.size,
-        mode: info.mode ?? (info.isDirectory ? 0o40755 : 0o100644),
-        ino: info.ino ?? 0,
-        uid: info.uid ?? 0,
-        gid: info.gid ?? 0,
-        dev: info.dev ?? 0,
-        mtimeMs: info.mtime?.getTime() ?? 0,
-        ctimeMs: info.mtime?.getTime() ?? 0,
-        mtime: info.mtime ?? new Date(0),
-        ctime: info.mtime ?? new Date(0),
-    });
-    const promises = {
-        readFile: async (path, opts) => {
-            try {
-                const bytes = await Deno.readFile(path);
-                const enc = typeof opts === "string" ? opts : opts?.encoding;
-                return enc ? new TextDecoder().decode(bytes) : bytes;
-            } catch (e) { throw mapErr(e); }
-        },
-        writeFile: async (path, data) => {
-            try { await Deno.writeFile(path, toBytes(data)); }
-            catch (e) { throw mapErr(e); }
-        },
-        unlink: async (path) => {
-            try { await Deno.remove(path); } catch (e) { throw mapErr(e); }
-        },
-        readdir: async (path) => {
-            try {
-                const names = [];
-                for await (const entry of Deno.readDir(path)) names.push(entry.name);
-                return names;
-            } catch (e) { throw mapErr(e); }
-        },
-        mkdir: async (path, opts) => {
-            try { await Deno.mkdir(path, { recursive: !!(opts && opts.recursive) }); }
-            catch (e) { throw mapErr(e); }
-        },
-        rmdir: async (path) => {
-            try { await Deno.remove(path); } catch (e) { throw mapErr(e); }
-        },
-        stat: async (path) => {
-            try { return toStats(await Deno.stat(path)); } catch (e) { throw mapErr(e); }
-        },
-        lstat: async (path) => {
-            try { return toStats(await Deno.lstat(path)); } catch (e) { throw mapErr(e); }
-        },
-        readlink: async (path) => {
-            try { return await Deno.readLink(path); } catch (e) { throw mapErr(e); }
-        },
-        symlink: async (target, path) => {
-            try { await Deno.symlink(target, path); } catch (e) { throw mapErr(e); }
-        },
-        chmod: async (path, mode) => {
-            try { await Deno.chmod(path, mode); } catch (e) { throw mapErr(e); }
-        },
-    };
-    globalThis.fs = { promises };
-})(globalThis);
-"#;
-
-/// Exposes `globalThis.browser`: an Astral browser that lazily connects to a
-/// host-spawned headless Chrome the first time it is used, then is reused for
-/// the rest of the session. A Proxy defers the (async) connect until an actual
-/// call or `await`, so guest code can write `await browser.newPage(url)` with no
-/// setup step — and Chrome is only launched if the agent actually browses.
-const BROWSER_SHIM: &str = r#"
-((globalThis) => {
-    // Captured before bootstrap (see [sdkmode:browser-op]); spawns the shared
-    // Chrome on first call and returns its CDP ws endpoint.
-    const chromeEndpoint = globalThis.__sdkmode_chromeEndpointOp;
-
-    let connecting = null;
-    const ready = () =>
-        (connecting ??= (async () => {
-            try {
-                const { connect } = await import("@astral/astral");
-                const endpoint = await chromeEndpoint();
-                // Astral's connect never rejects if the ws fails to open (it
-                // only listens for onopen), which would hang the turn with no
-                // pending ops. Race a deadline so failure becomes an error.
-                let timer;
-                const deadline = new Promise((_, reject) => {
-                    timer = setTimeout(
-                        () => reject(new Error("browser: could not connect to Chrome within 15s")),
-                        15000,
-                    );
-                });
-                try {
-                    return await Promise.race([connect({ endpoint }), deadline]);
-                } finally {
-                    clearTimeout(timer);
-                }
-            } catch (error) {
-                // Do not cache a failed connect: the next browser use retries
-                // (Chrome may have been slow to start, or was since killed).
-                connecting = null;
-                throw error;
-            }
-        })());
-
-    globalThis.browser = new Proxy(function () {}, {
-        get(_target, prop) {
-            // `await browser` resolves to the real Browser.
-            if (prop === "then") {
-                return (onFulfilled, onRejected) => ready().then(onFulfilled, onRejected);
-            }
-            // Any other access connects if needed, then forwards to the Browser.
-            return (...args) =>
-                ready().then((browser) => {
-                    const value = browser[prop];
-                    return typeof value === "function" ? value.apply(browser, args) : value;
-                });
-        },
-    });
-})(globalThis);
-"#;
-
-/// Exposes `globalThis.octokit`: an authenticated Octokit client that lazily
-/// imports `@octokit/rest` (from the pinned esm.sh URL) and constructs itself
-/// the first time it is touched, then is reused for the rest of the session.
-/// Modeled on [`BROWSER_SHIM`] — a Proxy defers the (async, network) import
-/// until an actual access — so `Session::new` needs no network and the REPL can
-/// start offline for local-only tasks.
-///
-/// Octokit is used through nested member chains (e.g.
-/// `octokit.rest.users.getAuthenticated()`), so a top-level `get` returns a
-/// *nested* proxy that keeps deferring: reads walk a property path, and a call
-/// awaits the real Octokit, walks that same path, and invokes the method with
-/// the correct `this`. Every leaf is a thenable, so `await octokit.rest.x.y()`
-/// resolves in a single expression exactly as the model writes it.
-const OCTOKIT_SHIM: &str = r#"
-((globalThis) => {
-    let loading = null;
-    // Import + construct once; a failed attempt is not cached so a later use
-    // (after transient network trouble) retries.
-    const ready = () =>
-        (loading ??= (async () => {
-            try {
-                const { Octokit } = await import("@octokit/rest");
-                return new Octokit();
-            } catch (error) {
-                loading = null;
-                throw error;
-            }
-        })());
-
-    // A proxy over the property path walked so far (`path`). Reading a property
-    // extends the path and returns another such proxy; `then` / calling resolve
-    // the real client and follow the path.
-    const make = (path) =>
-        new Proxy(function () {}, {
-            get(_target, prop) {
-                // `await octokit...` resolves the value at the current path.
-                if (prop === "then") {
-                    return (onFulfilled, onRejected) =>
-                        ready()
-                            .then((root) => path.reduce((obj, key) => obj[key], root))
-                            .then(onFulfilled, onRejected);
-                }
-                if (typeof prop === "symbol") return undefined;
-                return make([...path, prop]);
-            },
-            // Calling forwards to the method at the parent path, bound to its
-            // owner so Octokit's internal `this` is correct.
-            apply(_target, _thisArg, args) {
-                return ready().then((root) => {
-                    const parent = path
-                        .slice(0, -1)
-                        .reduce((obj, key) => obj[key], root);
-                    const fn = parent[path[path.length - 1]];
-                    return fn.apply(parent, args);
-                });
-            },
-        });
-
-    globalThis.octokit = make([]);
-})(globalThis);
-"#;
-
 /// Scopes each turn's network work to a per-turn `AbortController` (exposed as
 /// `globalThis.__sdkmode_abort`) by attaching its signal to every `fetch`. When
 /// a turn returns or throws, [`Session::eval`] aborts the controller so the
@@ -497,14 +294,15 @@ fn read_global_string(runtime: &mut deno_core::JsRuntime, expr: &'static str) ->
 /// Build a sandboxed Deno runtime with all extensions, permissions, and the
 /// console-[`CAPTURE_SHIM`] installed, ready to load modules or run scripts.
 fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
+    let sdks = crate::sdk::registry();
     let module_loader = std::rc::Rc::new(crate::esm_loader::EsmLoader::new()?);
-    // The snapshot bakes in the stock Deno extensions; our ops-only browser
-    // extension is appended at runtime (it has no JS to snapshot), so the
-    // snapshot set stays a prefix of the runtime set.
+    // The snapshot bakes in the stock Deno extensions; SDK extensions are
+    // ops-only (no JS to snapshot) and appended at runtime, so the snapshot
+    // set stays a prefix of the runtime set.
     let mut extensions = extensions::extensions(Some(
         deno_runtime::ops::bootstrap::SnapshotOptions::default(),
     ));
-    extensions.push(crate::browser::sdkmode_browser::init());
+    extensions.extend(sdks.iter().filter_map(|sdk| sdk.extension()));
     let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
         startup_snapshot: Some(RUNTIME_SNAPSHOT),
         module_loader: Some(module_loader),
@@ -552,15 +350,19 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
         deno_bundle_runtime::deno_bundle_runtime::args(None),
     ])?;
 
-    // Stash the browser op while `Deno.core` is still exposed: deno_runtime's
-    // bootstrap (run next) removes `Deno.core` before any guest code executes,
-    // but a captured op reference keeps working afterward.
-    runtime
-        .execute_script(
-            "[sdkmode:browser-op]",
-            "globalThis.__sdkmode_chromeEndpointOp = Deno.core.ops.op_sdkmode_chrome_endpoint;",
-        )
-        .map_err(|error| anyhow::anyhow!("failed to capture browser op: {}", error))?;
+    // Run SDK pre-bootstrap scripts while `Deno.core` is still exposed:
+    // deno_runtime's bootstrap (run next) removes `Deno.core` before any guest
+    // code executes, but a reference captured now keeps working afterward
+    // (e.g. the browser SDK stashes its Chrome-endpoint op).
+    for sdk in &sdks {
+        if let Some(script) = sdk.pre_bootstrap_script() {
+            runtime
+                .execute_script("[sdkmode:pre-bootstrap]", script)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to run {} pre-bootstrap script: {error}", sdk.name())
+                })?;
+        }
+    }
 
     {
         let state = runtime.op_state();
@@ -605,17 +407,18 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
         .execute_script("[sdkmode:env]", ENV_SHIM)
         .map_err(|error| anyhow::anyhow!("failed to install env shim: {}", error))?;
 
-    runtime
-        .execute_script("[sdkmode:fs]", FS_SHIM)
-        .map_err(|error| anyhow::anyhow!("failed to install fs shim: {}", error))?;
-
-    runtime
-        .execute_script("[sdkmode:browser]", BROWSER_SHIM)
-        .map_err(|error| anyhow::anyhow!("failed to install browser shim: {}", error))?;
-
-    runtime
-        .execute_script("[sdkmode:octokit]", OCTOKIT_SHIM)
-        .map_err(|error| anyhow::anyhow!("failed to install octokit shim: {}", error))?;
+    // Install each SDK's shim (lazy globals like `octokit` and `browser`, the
+    // `fs` adapter for isomorphic-git, …). The shims are independent IIFEs
+    // touching distinct globals, so registry order is not load-bearing.
+    for sdk in &sdks {
+        if let Some(shim) = sdk.shim() {
+            runtime
+                .execute_script("[sdkmode:sdk-shim]", shim)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to install {} shim: {error}", sdk.name())
+                })?;
+        }
+    }
 
     runtime
         .execute_script("[sdkmode:abort]", ABORT_SHIM)
@@ -686,14 +489,14 @@ pub struct Session {
 
 impl Session {
     /// Create a session. `globalThis.octokit` is available to every turn without
-    /// importing, but it is *lazy*: the [`OCTOKIT_SHIM`] proxy imports
-    /// `@octokit/rest` and constructs the client only on first use. So `new()`
-    /// does no network I/O and the REPL can start offline for local-only tasks;
-    /// the octokit import happens later, the first time a turn actually touches
-    /// `octokit`.
+    /// importing, but it is *lazy*: the octokit shim's proxy (see
+    /// `sdk::github`) imports `@octokit/rest` and constructs the client only on
+    /// first use. So `new()` does no network I/O and the REPL can start offline
+    /// for local-only tasks; the octokit import happens later, the first time a
+    /// turn actually touches `octokit`.
     pub async fn new() -> Result<Self, anyhow::Error> {
-        // The runtime is fully built by `build_runtime` (which installs the
-        // lazy OCTOKIT_SHIM). There is nothing left to load over the network
+        // The runtime is fully built by `build_runtime` (which installs every
+        // SDK's lazy shim). There is nothing left to load over the network
         // here, so no main module is evaluated at session start.
         let runtime = build_runtime()?;
         Ok(Self { runtime })
