@@ -1,4 +1,3 @@
-mod browser;
 mod esm_loader;
 mod extensions;
 pub(crate) mod fetch;
@@ -9,6 +8,7 @@ mod mcp;
 mod repl;
 mod sandbox;
 pub(crate) mod sdk;
+mod status;
 mod transform;
 
 fn main() {
@@ -31,8 +31,9 @@ fn main() {
         }
     };
 
-    // Tear down the shared headless Chrome (if the agent ever launched one).
-    runtime.block_on(browser::shutdown());
+    // Tear down SDK host-side state (e.g. the shared headless Chrome, if the
+    // agent ever launched one).
+    runtime.block_on(sdk::shutdown());
 
     if let Err(error) = result {
         eprintln!("error: {}", error);
