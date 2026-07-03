@@ -27,48 +27,27 @@ use crate::{llm, sandbox, transform};
 /// forever.
 const MAX_STEPS: usize = 12;
 
-/// The preamble that opens the rendered program. Valid JavaScript and the framing
-/// the model sees: `octokit` is authenticated, `prompt` holds the latest message.
-const SEED: &str = r#"import { Octokit } from "@octokit/rest";
-
-// You are a helpful assistant in a REPL that can use authenticated SDKs.
-// Think in // comments and console.log(). Return a value to answer the user.
-const octokit = new Octokit();
+/// The framing that opens the rendered program, ahead of the per-SDK blocks.
+const SEED_HEADER: &str = r#"// You are a helpful assistant in a REPL that can use authenticated SDKs.
+// Think in // comments; hold results in variables (they persist across steps).
+// Let code make every decision code can — max, sort, filter, count — and
+// console.log only data you must exercise judgement on. Return a value to
+// answer the user.
 let prompt;
-
-// octokit is authenticated as the current user. For "you" / "your" / "my",
-// get the identity from GitHub — never guess from an email. For example:
-//   const me = (await octokit.rest.users.getAuthenticated()).data.login; // your real username
-
-// For local files, use the Deno std library and Deno globals (node:fs is NOT
-// available). For example:
-//   import { walk, expandGlob } from "@std/fs";
-//   for await (const f of expandGlob("src/**/*.rs")) { /* f.path */ }   // find files
-//   const text = await Deno.readTextFile("Cargo.toml");                 // read
-//   await Deno.writeTextFile("path", text);                            // write / edit
-
-// Local git runs via isomorphic-git, with a ready `fs` global wired to the
-// working directory (there is NO shell — Deno.Command/child_process are
-// blocked, so "git status" is `git.statusMatrix`, not a command). Import the
-// bare specifier, never a URL. For example:
-//   import git from "isomorphic-git";
-//   const branch = await git.currentBranch({ fs, dir: "." });
-//   const commits = await git.log({ fs, dir: ".", depth: 5 });           // recent history
-//   const status = await git.statusMatrix({ fs, dir: "." });             // working-tree status
-//   import http from "isomorphic-git/http/web";                          // remote repos
-//   const url = "https://github.com/<owner>/<repo>.git";                 // https, not git@ SSH
-//   const info = await git.getRemoteInfo({ http, url });                 // list refs
-//   await git.push({ fs, http, dir: ".", url });                         // auth is brokered — do
-//                                                                        // NOT pass onAuth
-
-// Browser automation: `browser` is always available — it lazily launches a
-// headless Chrome (host-side) and connects on first use. It is an Astral
-// browser; just use it. For example:
-//   const page = await browser.newPage("https://example.com");
-//   const title = await page.evaluate(() => document.title);   // run JS in the page
-//   const text = await page.evaluate(() => document.body.innerText);
-//   const html = await page.content();
 "#;
+
+/// The preamble that opens the rendered program: the header plus every
+/// registered SDK's seed block (see [`crate::sdk::Docs::seed`]), in registry
+/// order. Valid JavaScript — assembled once, on first use.
+static SEED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let mut seed = String::from(SEED_HEADER);
+    for sdk in crate::sdk::registry() {
+        seed.push('\n');
+        seed.push_str(sdk.docs().seed);
+        seed.push('\n');
+    }
+    seed
+});
 
 /// One entry in the session transcript that is rendered back to the model.
 enum Entry {
@@ -177,7 +156,7 @@ fn comment_block(label: &str, text: &str) -> String {
 
 /// The growing JavaScript program shown to the model: seed + every entry so far.
 fn build_context(entries: &[Entry]) -> String {
-    let mut context = String::from(SEED);
+    let mut context = SEED.clone();
     for entry in entries {
         match entry {
             Entry::User(message) => {
@@ -240,13 +219,59 @@ fn print_error(error: &str) {
     }
 }
 
+/// The status line's note for a phase: `thinking · step 2 · $0.011`. No total
+/// is shown — [`MAX_STEPS`] is a safety cap, not a plan, so a `/12` would
+/// wrongly read as a progress bar. Cost appears once there is any.
+fn status_note(phase: &str, step: usize, cost_usd: f64) -> String {
+    if cost_usd > 0.0 {
+        format!("{phase} · step {step} · ${cost_usd:.3}")
+    } else {
+        format!("{phase} · step {step}")
+    }
+}
+
+/// Forwards streamed code to the highlight block, erasing the status line the
+/// moment the first delta arrives so the spinner never collides with output,
+/// and restoring it while a failed attempt is retried.
+struct StatusSink<'a> {
+    inner: &'a mut crate::highlight::CodeBlock,
+    status: &'a std::cell::RefCell<crate::status::StatusLine>,
+}
+
+impl llm::CodeSink for StatusSink<'_> {
+    fn on_delta(&mut self, text: &str) {
+        self.status.borrow_mut().clear();
+        self.inner.on_delta(text);
+    }
+
+    fn on_retry(&mut self) {
+        self.inner.on_retry();
+        self.status.borrow_mut().update("retrying");
+    }
+}
+
 /// Run one user message as a full agent turn: repeated steps until the agent
 /// returns a value, errors out of all its retries, or hits [`MAX_STEPS`].
-async fn handle_message(message: &str, entries: &mut Vec<Entry>, session: &mut sandbox::Session) {
+async fn handle_message(
+    message: &str,
+    entries: &mut Vec<Entry>,
+    session: &mut sandbox::Session,
+    llm: &llm::Llm,
+) {
     entries.push(Entry::User(message.to_string()));
 
     let mut steps = 0usize;
     let mut cost_usd = 0.0;
+    let started = std::time::Instant::now();
+
+    // The transient spinner filling the two silent phases: waiting on the
+    // model, and running a step. In a RefCell because the streaming sink must
+    // erase it on the first delta while the `select!` ticker animates it — the
+    // two borrows never overlap (single thread; the sink only runs while the
+    // completion future is being polled, the ticker only while it is not).
+    let status = std::cell::RefCell::new(crate::status::StatusLine::new());
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     for _ in 0..MAX_STEPS {
         let context = build_context(entries);
@@ -254,8 +279,27 @@ async fn handle_message(message: &str, entries: &mut Vec<Entry>, session: &mut s
         // Stream the model's code live into a highlighted block (on stderr),
         // with a blank line separating steps.
         eprintln!();
-        let mut block = crate::highlight::CodeBlock::new();
-        let code = match llm::complete(&context, &mut block).await {
+        let mut block = crate::highlight::CodeBlock::new(&format!("step {}", steps + 1));
+        status
+            .borrow_mut()
+            .update(&status_note("thinking", steps + 1, cost_usd));
+        let completion = {
+            let mut sink = StatusSink {
+                inner: &mut block,
+                status: &status,
+            };
+            let fut = llm.complete(&context, &mut sink);
+            tokio::pin!(fut);
+            loop {
+                tokio::select! {
+                    result = &mut fut => break result,
+                    _ = ticker.tick() => status.borrow_mut().tick(),
+                }
+            }
+        };
+        status.borrow_mut().clear();
+
+        let code = match completion {
             Ok(completion) if !completion.code.trim().is_empty() => {
                 block.finish();
                 steps += 1;
@@ -274,7 +318,26 @@ async fn handle_message(message: &str, entries: &mut Vec<Entry>, session: &mut s
             }
         };
 
-        let result = match session.eval(build_executable(message, &code)).await {
+        // Run the step. The spinner advances whenever the guest yields (its
+        // awaits: network, timers); a synchronous stretch freezes it, since
+        // guest JS shares this thread — that's the known single-thread
+        // trade-off, and the watchdog still bounds the step.
+        status
+            .borrow_mut()
+            .update(&status_note("running", steps, cost_usd));
+        let eval_result = {
+            let fut = session.eval(build_executable(message, &code));
+            tokio::pin!(fut);
+            loop {
+                tokio::select! {
+                    result = &mut fut => break result,
+                    _ = ticker.tick() => status.borrow_mut().tick(),
+                }
+            }
+        };
+        status.borrow_mut().clear();
+
+        let result = match eval_result {
             Ok(result) => result,
             Err(sandbox_error) => {
                 let error = format!("sandbox error: {sandbox_error}");
@@ -312,6 +375,7 @@ async fn handle_message(message: &str, entries: &mut Vec<Entry>, session: &mut s
             crate::markdown::print_answer(&answer);
             entries.push(Entry::Answer(answer));
             emit_metrics(steps, cost_usd);
+            print_turn_summary(steps, cost_usd, started.elapsed());
             return;
         }
 
@@ -319,7 +383,28 @@ async fn handle_message(message: &str, entries: &mut Vec<Entry>, session: &mut s
     }
 
     emit_metrics(steps, cost_usd);
+    print_turn_summary(steps, cost_usd, started.elapsed());
     eprintln!("(the assistant did not return an answer after {MAX_STEPS} steps)");
+}
+
+/// A dim one-line recap after a turn ends — `(3 steps · $0.012 · 8.4s)` — so
+/// cost is visible without setting `SDKMODE_METRICS`. Stays on stderr with the
+/// rest of the working noise; plain when stderr is piped.
+fn print_turn_summary(steps: usize, cost_usd: f64, elapsed: std::time::Duration) {
+    use std::io::IsTerminal;
+    if steps == 0 {
+        return;
+    }
+    let plural = if steps == 1 { "" } else { "s" };
+    let line = format!(
+        "({steps} step{plural} · ${cost_usd:.3} · {:.1}s)",
+        elapsed.as_secs_f64()
+    );
+    if std::io::stderr().is_terminal() {
+        eprintln!("\x1b[2m{line}\x1b[0m");
+    } else {
+        eprintln!("{line}");
+    }
 }
 
 /// When `SDKMODE_METRICS` is set, print a machine-readable metrics line on
@@ -338,11 +423,12 @@ pub async fn run() -> anyhow::Result<()> {
 
     let mut entries: Vec<Entry> = Vec::new();
     let mut session = sandbox::Session::new().await?;
+    let llm = llm::Llm::new();
 
     if std::io::stdin().is_terminal() {
-        run_interactive(&mut entries, &mut session).await
+        run_interactive(&mut entries, &mut session, &llm).await
     } else {
-        run_piped(&mut entries, &mut session).await
+        run_piped(&mut entries, &mut session, &llm).await
     }
 }
 
@@ -351,6 +437,7 @@ pub async fn run() -> anyhow::Result<()> {
 async fn run_interactive(
     entries: &mut Vec<Entry>,
     session: &mut sandbox::Session,
+    llm: &llm::Llm,
 ) -> anyhow::Result<()> {
     let mut editor = build_editor();
     let prompt = ReplPrompt;
@@ -377,13 +464,13 @@ async fn run_interactive(
                 }
                 #[cfg(unix)]
                 tokio::select! {
-                    _ = handle_message(&message, entries, session) => {}
+                    _ = handle_message(&message, entries, session, llm) => {}
                     _ = sigint.recv() => {
                         eprintln!("\n(interrupted — Ctrl-D to exit)");
                     }
                 }
                 #[cfg(not(unix))]
-                handle_message(&message, entries, session).await;
+                handle_message(&message, entries, session, llm).await;
             }
             Ok(Signal::CtrlC) => continue, // clears the input line; Ctrl-D exits
             Ok(Signal::CtrlD) => break,
@@ -398,9 +485,42 @@ async fn run_interactive(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::SEED;
+
+    /// The assembled seed must be valid JavaScript — it opens the one growing
+    /// program the model completes, so a syntax error here poisons every turn.
+    #[test]
+    fn assembled_seed_is_valid_javascript() {
+        assert!(
+            crate::transform::is_parseable(&SEED),
+            "assembled seed does not parse:\n{}",
+            &*SEED
+        );
+    }
+
+    /// Every registered SDK's seed block must make it into the assembly, or
+    /// the model would never learn that capability exists.
+    #[test]
+    fn assembled_seed_documents_every_sdk() {
+        for sdk in crate::sdk::registry() {
+            assert!(
+                SEED.contains(sdk.docs().seed),
+                "seed is missing the {} block",
+                sdk.name()
+            );
+        }
+    }
+}
+
 /// Non-terminal path: one message per line on stdin, until EOF. Lines that
 /// arrive while a turn is running stay buffered by the OS until we read them.
-async fn run_piped(entries: &mut Vec<Entry>, session: &mut sandbox::Session) -> anyhow::Result<()> {
+async fn run_piped(
+    entries: &mut Vec<Entry>,
+    session: &mut sandbox::Session,
+    llm: &llm::Llm,
+) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -409,7 +529,7 @@ async fn run_piped(entries: &mut Vec<Entry>, session: &mut sandbox::Session) -> 
         if message.is_empty() {
             continue;
         }
-        handle_message(&message, entries, session).await;
+        handle_message(&message, entries, session, llm).await;
     }
 
     Ok(())
