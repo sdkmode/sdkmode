@@ -3,10 +3,9 @@ use deno_fetch::{ReqBody, RequestBuilder};
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 struct RequestInterceptor {
-    sdks: Vec<Arc<Mutex<dyn crate::sdk::Sdk>>>,
+    sdks: Vec<Arc<dyn crate::sdk::Sdk>>,
 }
 
 impl RequestInterceptor {
@@ -24,36 +23,21 @@ impl RequestBuilder for RequestInterceptor {
     ) -> Pin<Box<dyn Future<Output = Result<(), JsErrorBox>> + Send + 'a>> {
         Box::pin(async move {
             let host = request.uri().host().map(str::to_string);
-            let path = request.uri().path();
+            let path = request.uri().path().to_string();
 
-            // Git smart-HTTP lives on the web host (e.g. `github.com`) rather than
-            // the API host (`api.github.com`), and authenticates with Basic, not
-            // Bearer. We broker it by pairing the web host with whichever SDK owns
-            // the `api.<host>` API host, but only on the well-known git endpoints —
-            // a bare web fetch to the host never receives credentials.
-            let is_git_smart_http = path.ends_with("/info/refs")
-                || path.ends_with("/git-upload-pack")
-                || path.ends_with("/git-receive-pack");
-            let git_api_host = host.as_deref().map(|h| format!("api.{h}"));
+            // Ask each SDK's auth facet whether it brokers this request.
+            // Claiming is pure host/path matching, so no auth state is touched
+            // for the (common) unclaimed case.
+            let claimed = host.as_deref().and_then(|host| {
+                self.sdks
+                    .iter()
+                    .filter_map(|sdk| sdk.auth())
+                    .find(|auth| auth.claims(host, &path))
+            });
 
-            // Find a registered SDK matching this request: directly on its API
-            // host, or (for git requests) on the paired `api.<host>` host.
-            let mut matched: Option<(Arc<Mutex<dyn crate::sdk::Sdk>>, bool)> = None;
-            for candidate in &self.sdks {
-                let api_host = candidate.lock().await.url().host_str().map(str::to_string);
-                if api_host.as_deref() == host.as_deref() {
-                    matched = Some((candidate.clone(), false));
-                    break;
-                }
-                if is_git_smart_http && api_host.as_deref() == git_api_host.as_deref() {
-                    matched = Some((candidate.clone(), true));
-                    break;
-                }
-            }
-
-            let Some((sdk, is_git)) = matched else {
-                // Not a registered SDK: this is general web access. We inject no
-                // credentials, but block requests to the host's own loopback,
+            let Some(auth) = claimed else {
+                // Not claimed by any SDK: this is general web access. We inject
+                // no credentials, but block requests to the host's own loopback,
                 // private, and link-local ranges (SSRF / cloud metadata).
                 return match host.as_deref() {
                     Some(host) if !is_blocked_host(host) => Ok(()),
@@ -64,58 +48,13 @@ impl RequestBuilder for RequestInterceptor {
                 };
             };
 
-            let mut sdk = sdk.lock().await;
-
-            if !sdk.is_authed() {
-                sdk.auth().await?;
-            }
-
-            // For git smart-HTTP, present the SDK's token as HTTP Basic (token as
-            // the password) instead of the API's Bearer scheme.
-            let auth = match (is_git, sdk.auth_header()) {
-                (true, Some(bearer)) => {
-                    use base64::Engine;
-                    let token = bearer.strip_prefix("Bearer ").unwrap_or(&bearer).trim();
-                    let creds = base64::engine::general_purpose::STANDARD
-                        .encode(format!("x-access-token:{token}"));
-                    Some(format!("Basic {creds}"))
-                }
-                (false, header) => header,
-                (true, None) => None,
-            };
-
+            // Brokered request: guest-supplied credentials never pass through —
+            // strip them centrally, then let the SDK inject its own.
             let headers = request.headers_mut();
-
             headers.remove(http::header::AUTHORIZATION);
             headers.remove(http::header::COOKIE);
 
-            if let Some(auth_header) = auth {
-                headers.insert(
-                    http::header::AUTHORIZATION,
-                    auth_header
-                        .parse::<http::HeaderValue>()
-                        .map_err(|e| JsErrorBox::generic(e.to_string()))?,
-                );
-            }
-
-            if !is_git
-                && let Some(cookies) = sdk.cookies()
-                && !cookies.is_empty()
-            {
-                let cookie_str = cookies
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                headers.insert(
-                    http::header::COOKIE,
-                    cookie_str
-                        .parse::<http::HeaderValue>()
-                        .map_err(|e| JsErrorBox::generic(e.to_string()))?,
-                );
-            }
-
-            Ok(())
+            auth.apply(request).await
         })
     }
 }

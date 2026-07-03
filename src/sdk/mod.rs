@@ -1,145 +1,198 @@
+//! The SDK registry: every capability the agent can use — GitHub, local git,
+//! local files, the browser — registered in one place, through one trait.
+//!
+//! Each SDK owns all of its facets: the import specifiers it grants (with
+//! their esm.sh version pins), the JS shim that exposes its global (if any),
+//! the prose documenting it to the model, its Rust ops, and — optionally — an
+//! [`Auth`] facet that brokers credentials into its outgoing requests. The
+//! consumers (import allowlist, shim installation, prompt assembly, the fetch
+//! broker, shutdown) all iterate [`registry`], so adding an SDK is one module
+//! plus one line here.
+
 use deno_error::JsErrorBox;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use url::Url;
 
+pub(crate) mod browser;
+pub(crate) mod files;
+pub(crate) mod git;
 pub(crate) mod github;
 
+/// Prose fragments describing an SDK everywhere the model (or an MCP client)
+/// learns about the environment. Kept next to the SDK's code so capability and
+/// documentation cannot drift apart.
+pub(crate) struct Docs {
+    /// Block appended to the REPL seed program. Must be valid JavaScript
+    /// (declarations and `//` comments) — the seed is rendered as one program.
+    pub seed: &'static str,
+    /// Bullet for the engine system prompt's Environment section, when the SDK
+    /// warrants one beyond the import allowlist (the assembler adds the `- `).
+    pub system_prompt: Option<&'static str>,
+    /// How the SDK's packages appear in the system prompt's allowlist sentence.
+    pub import_blurb: &'static str,
+    /// How the SDK's packages appear in the MCP tool description's allowlist.
+    pub mcp_blurb: &'static str,
+}
+
+/// One capability the agent can use. Only `name`, `imports`, and `docs` are
+/// required; every other facet defaults to "not present".
 pub(crate) trait Sdk: Send + Sync {
-    fn url(&self) -> Url;
-    fn auth<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<(), JsErrorBox>> + Send + 'a>>;
-    fn is_authed(&self) -> bool;
-    fn auth_header(&self) -> Option<String>;
-    fn cookies(&self) -> Option<HashMap<String, String>>;
-    /// The npm package specifiers this SDK permits the sandbox to import (from
-    /// esm.sh). The import allowlist is the union of these across all SDKs.
-    fn packages(&self) -> &'static [&'static str];
-}
+    fn name(&self) -> &'static str;
 
-/// Live SDK instances used by the fetch broker; each carries mutable auth state.
-/// Register new SDKs here *and* in [`descriptors`].
-pub(crate) fn registry() -> Vec<Arc<Mutex<dyn Sdk>>> {
-    vec![Arc::new(Mutex::new(github::GitHub::new()))]
-}
+    /// Bare import specifiers this SDK grants the sandbox, mapped to their
+    /// esm.sh URLs. Every URL must be pinned to an explicit version, for
+    /// supply-chain reproducibility: an unpinned specifier floats to whatever
+    /// esm.sh serves today, so a fresh process could silently pull different
+    /// code (and the persistent disk cache in `esm_loader` relies on these URLs
+    /// being immutable). To bump a pin, resolve the new version from esm.sh —
+    /// e.g. `curl -fsSLI https://esm.sh/<pkg>` and read the `x-esm-path`
+    /// header — then verify the pinned URL returns 200 before committing.
+    fn imports(&self) -> &'static [(&'static str, &'static str)];
 
-/// Read-only SDK instances, for static metadata (packages) without auth state.
-fn descriptors() -> Vec<Box<dyn Sdk>> {
-    vec![Box::new(github::GitHub::new())]
-}
+    fn docs(&self) -> Docs;
 
-/// esm.sh version pin for the one SDK package (`@octokit/rest`). Kept next to
-/// the other pins below; see the module-level note on bumping these.
-const OCTOKIT_REST_VERSION: &str = "22.0.1";
-
-/// The allowlist of bare import specifiers mapped to their URLs: the standard
-/// tooling packages plus every registered SDK's npm package (from esm.sh).
-///
-/// Every esm.sh URL here is pinned to an explicit version deliberately, for
-/// supply-chain reproducibility: an unpinned specifier floats to whatever
-/// esm.sh serves today, so a fresh process could silently pull different code
-/// (and the persistent disk cache in `esm_loader` relies on these URLs being
-/// immutable). To bump a pin, resolve the new version from esm.sh — e.g.
-/// `curl -fsSLI https://esm.sh/<pkg>` and read the `x-esm-path` header — then
-/// verify the pinned URL returns 200 before committing.
-pub(crate) fn allowed_imports() -> Vec<(String, String)> {
-    let mut imports = vec![
-        // Deno std filesystem helpers (walk, expandGlob, …) for local file work,
-        // served as transpiled JS via esm.sh's JSR proxy. Built on `Deno.*`, so
-        // it runs under the existing cwd permissions with no extra wiring.
-        (
-            "@std/fs".to_string(),
-            "https://esm.sh/jsr/@std/fs@1.0.24".to_string(),
-        ),
-        // Pure-JS git: the core package and its fetch-based http client. Both are
-        // pinned to the same isomorphic-git version so they stay compatible.
-        (
-            "isomorphic-git".to_string(),
-            "https://esm.sh/isomorphic-git@1.38.6".to_string(),
-        ),
-        (
-            "isomorphic-git/http/web".to_string(),
-            "https://esm.sh/isomorphic-git@1.38.6/http/web".to_string(),
-        ),
-        // Browser automation: the Astral CDP client connects to a host-spawned
-        // Chrome (see `globalThis.browser`). Deno-native, so it loads cleanly
-        // where playwright-core does not.
-        (
-            "@astral/astral".to_string(),
-            "https://esm.sh/jsr/@astral/astral@0.5.6".to_string(),
-        ),
-    ];
-    for sdk in descriptors() {
-        for package in sdk.packages() {
-            // The KEY stays the bare specifier the agent imports (so the
-            // drift-guard tests still match `packages()` against these keys);
-            // only the URL value carries the version pin. There is a single SDK
-            // package (`@octokit/rest`), so a direct pin lookup suffices.
-            let url = match *package {
-                "@octokit/rest" => {
-                    format!("https://esm.sh/@octokit/rest@{OCTOKIT_REST_VERSION}")
-                }
-                // A newly registered SDK package must be pinned above too; until
-                // then it falls back to the unpinned URL (and CI's drift guards
-                // still force it into this allowlist).
-                other => format!("https://esm.sh/{other}"),
-            };
-            imports.push(((*package).to_string(), url));
-        }
+    /// Script run before the runtime bootstrap, while `Deno.core` is still
+    /// exposed — e.g. to capture an op reference the shim needs later.
+    fn pre_bootstrap_script(&self) -> Option<&'static str> {
+        None
     }
-    imports
+
+    /// JS installed after bootstrap: lazy globals, adapters, and the like.
+    fn shim(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// A Rust ops extension appended to the runtime set (never snapshotted, so
+    /// the snapshot extension set stays a prefix of the runtime set).
+    fn extension(&self) -> Option<deno_core::Extension> {
+        None
+    }
+
+    /// The auth facet, if this SDK brokers credentials into requests.
+    fn auth(&self) -> Option<Arc<dyn Auth>> {
+        None
+    }
+
+    /// Host-side teardown at process exit (e.g. killing a helper process).
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
+
+/// The credential-brokering facet of an SDK. Split from [`Sdk`] so that the
+/// registry stays lock-free for read-only facets: only an SDK that actually
+/// brokers requests carries auth state, behind its own interior mutex.
+pub(crate) trait Auth: Send + Sync {
+    /// Whether this SDK brokers requests to `host`/`path`. Pure matching — no
+    /// state, no locking, no I/O.
+    fn claims(&self, host: &str, path: &str) -> bool;
+
+    /// Rewrite the outgoing request with credentials — headers, cookies, query
+    /// parameters, signing, whatever the API needs. Runs after the broker has
+    /// stripped guest-supplied `Authorization`/`Cookie`, so nothing the guest
+    /// set can leak through a brokered request.
+    fn apply<'a>(
+        &'a self,
+        request: &'a mut http::Request<deno_fetch::ReqBody>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), JsErrorBox>> + Send + 'a>>;
+}
+
+/// Every registered SDK, in the order their documentation is presented to the
+/// model (the REPL seed and the prompt allowlist follow this order).
+pub(crate) fn registry() -> Vec<Arc<dyn Sdk>> {
+    vec![
+        Arc::new(github::GitHub::new()),
+        Arc::new(files::Files),
+        Arc::new(git::Git),
+        Arc::new(browser::Browser),
+    ]
+}
+
+/// Tear down every SDK's host-side state (e.g. the shared headless Chrome).
+/// Instances are cheap to construct and any real teardown state is
+/// process-global (see `sdk::browser`), so a fresh registry works here.
+pub(crate) async fn shutdown() {
+    for sdk in registry() {
+        sdk.shutdown().await;
+    }
+}
+
+/// The allowlist of bare import specifiers mapped to their pinned URLs: the
+/// union of every registered SDK's [`Sdk::imports`].
+pub(crate) fn allowed_imports() -> Vec<(String, String)> {
+    registry()
+        .iter()
+        .flat_map(|sdk| sdk.imports())
+        .map(|(specifier, url)| ((*specifier).to_string(), (*url).to_string()))
+        .collect()
+}
+
+/// Join blurbs into a natural-language list: "a", "a and b", "a, b, and c".
+pub(crate) fn oxford_join(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [a, b] => format!("{a} and {b}"),
+        [init @ .., last] => format!("{}, and {last}", init.join(", ")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Guards the "register each SDK in both `registry()` and `descriptors()`"
-    /// invariant. The broker authenticates from `registry()` while the import
-    /// allowlist is built from `descriptors()`; if the two lists drift, agent
-    /// code can import an SDK that never gets credentials, or vice versa.
-    #[tokio::test]
-    async fn registry_and_descriptors_describe_the_same_sdks() {
-        let registry = registry();
-        let descriptors = descriptors();
-        assert_eq!(
-            registry.len(),
-            descriptors.len(),
-            "registry() and descriptors() differ in length; register each SDK in both"
-        );
-
-        let mut live_meta = Vec::new();
-        for sdk in &registry {
-            let sdk = sdk.lock().await;
-            live_meta.push((sdk.url().to_string(), sdk.packages().to_vec()));
-        }
-        live_meta.sort();
-
-        let mut descriptor_meta: Vec<_> = descriptors
-            .iter()
-            .map(|sdk| (sdk.url().to_string(), sdk.packages().to_vec()))
-            .collect();
-        descriptor_meta.sort();
-
-        assert_eq!(
-            live_meta, descriptor_meta,
-            "registry() and descriptors() describe different SDKs; keep them in sync"
-        );
-    }
-
-    /// Every SDK's declared packages must appear in the import allowlist, or
-    /// agent code could never import the very SDK the broker authenticates.
+    /// Every import URL must carry an explicit version pin (an `@` after the
+    /// host), so the disk cache's immutability assumption holds.
     #[test]
-    fn allowed_imports_cover_every_sdk_package() {
-        let imports = allowed_imports();
-        for descriptor in descriptors() {
-            for package in descriptor.packages() {
+    fn every_import_url_is_version_pinned() {
+        for sdk in registry() {
+            for (specifier, url) in sdk.imports() {
+                let path = url
+                    .strip_prefix("https://esm.sh/")
+                    .unwrap_or_else(|| panic!("{specifier}: non-esm.sh URL {url}"));
                 assert!(
-                    imports.iter().any(|(spec, _url)| spec == package),
-                    "SDK package {package:?} is missing from allowed_imports()"
+                    path.contains('@'),
+                    "{specifier}: URL {url} has no version pin"
                 );
             }
         }
+    }
+
+    /// The loader's allowlist must cover every SDK's imports — this is now
+    /// structural (both come from `registry()`), but the test guards against a
+    /// future refactor reintroducing a second list.
+    #[test]
+    fn allowed_imports_cover_every_sdk_import() {
+        let imports = allowed_imports();
+        for sdk in registry() {
+            for (specifier, url) in sdk.imports() {
+                assert!(
+                    imports
+                        .iter()
+                        .any(|(spec, pinned)| spec == specifier && pinned == url),
+                    "SDK {} import {specifier:?} missing from allowed_imports()",
+                    sdk.name()
+                );
+            }
+        }
+    }
+
+    /// No two SDKs may grant the same bare specifier.
+    #[test]
+    fn import_specifiers_are_unique() {
+        let imports = allowed_imports();
+        let mut specifiers: Vec<&str> = imports.iter().map(|(s, _)| s.as_str()).collect();
+        specifiers.sort();
+        let before = specifiers.len();
+        specifiers.dedup();
+        assert_eq!(before, specifiers.len(), "duplicate import specifier");
+    }
+
+    #[test]
+    fn oxford_join_reads_naturally() {
+        assert_eq!(oxford_join(&[]), "");
+        assert_eq!(oxford_join(&["a"]), "a");
+        assert_eq!(oxford_join(&["a", "b"]), "a and b");
+        assert_eq!(oxford_join(&["a", "b", "c"]), "a, b, and c");
     }
 }
