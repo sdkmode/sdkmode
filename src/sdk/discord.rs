@@ -91,10 +91,7 @@ impl Sdk for Discord {
     fn imports(&self) -> &'static [(&'static str, &'static str)] {
         // discordeno only. `@discordjs/rest` bundles undici and times out over
         // esm.sh; discordeno is Deno-native and loads cleanly.
-        &[(
-            "@discordeno/rest",
-            "https://esm.sh/@discordeno/rest@21.0.0",
-        )]
+        &[("@discordeno/rest", "https://esm.sh/@discordeno/rest@21.0.0")]
     }
 
     fn docs(&self) -> Docs {
@@ -171,7 +168,9 @@ impl Auth for DiscordAuth {
                 ));
             }
 
-            let token = std::env::var(TOKEN_ENV).ok().filter(|t| !t.trim().is_empty());
+            let token = std::env::var(TOKEN_ENV)
+                .ok()
+                .filter(|t| !t.trim().is_empty());
             let Some(token) = token else {
                 return Err(JsErrorBox::generic(format!(
                     "no Discord bot token: set {TOKEN_ENV} (a bot token from the Discord \

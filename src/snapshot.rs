@@ -76,7 +76,10 @@ pub fn load(path: &Path) -> Option<Snapshot> {
         return None;
     }
     Some(Snapshot {
-        saved_at_ms: value.get("saved_at_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        saved_at_ms: value
+            .get("saved_at_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
         cwd: value
             .get("cwd")
             .and_then(|v| v.as_str())
@@ -156,7 +159,10 @@ pub fn parse_collected(raw: &str) -> (serde_json::Value, Vec<String>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return empty();
     };
-    let vars = value.get("vars").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let vars = value
+        .get("vars")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     let lost = value
         .get("lost")
         .and_then(|v| v.as_array())
@@ -174,8 +180,7 @@ pub fn parse_collected(raw: &str) -> (serde_json::Value, Vec<String>) {
 /// The vars are double-encoded (a JSON string literal fed to `JSON.parse`) so
 /// arbitrary values can never break out of the script text.
 pub fn restore_script(vars: &serde_json::Value) -> String {
-    let literal = serde_json::to_string(&vars.to_string())
-        .unwrap_or_else(|_| "\"{}\"".to_string());
+    let literal = serde_json::to_string(&vars.to_string()).unwrap_or_else(|_| "\"{}\"".to_string());
     format!("Object.assign(globalThis, JSON.parse({literal}));")
 }
 
@@ -185,10 +190,8 @@ mod tests {
 
     #[test]
     fn snapshot_round_trips_through_disk() {
-        let path = std::env::temp_dir().join(format!(
-            "sdkmode-snapshot-test-{}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("sdkmode-snapshot-test-{}.json", std::process::id()));
         let snapshot = Snapshot {
             saved_at_ms: 1234,
             cwd: "/somewhere/else".to_string(),

@@ -236,10 +236,7 @@ fn handle_payload(
 
 /// React to a dispatch (`op` 0): log READY, forward each `MESSAGE_CREATE` data
 /// object onto the events channel for the agent to consider.
-fn on_dispatch(
-    payload: &serde_json::Value,
-    events_tx: &mpsc::UnboundedSender<serde_json::Value>,
-) {
+fn on_dispatch(payload: &serde_json::Value, events_tx: &mpsc::UnboundedSender<serde_json::Value>) {
     let Some(kind) = payload.get("t").and_then(serde_json::Value::as_str) else {
         return;
     };
@@ -264,8 +261,7 @@ fn on_dispatch(
 
 /// The IDENTIFY payload (op 2): token, intents, and minimal properties.
 fn identify(token: &str, want_content: bool) -> Message {
-    let intents =
-        GUILD_MESSAGES | DIRECT_MESSAGES | if want_content { MESSAGE_CONTENT } else { 0 };
+    let intents = GUILD_MESSAGES | DIRECT_MESSAGES | if want_content { MESSAGE_CONTENT } else { 0 };
     let payload = serde_json::json!({
         "op": 2,
         "d": {
@@ -359,7 +355,9 @@ mod tests {
     async fn default_policy_ignores_bots_and_escalates_humans() {
         let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut session = crate::sandbox::Session::new().await.expect("session");
-        session.run_host_script(DEFAULT_POLICY).expect("install policy");
+        session
+            .run_host_script(DEFAULT_POLICY)
+            .expect("install policy");
 
         let decide = |session: &mut crate::sandbox::Session, event: &str| {
             session.read_to_string(format!(
@@ -378,8 +376,17 @@ mod tests {
             r#"{ "author": { "username": "he1d1" }, "channel_id": "42", "content": "hey bot" }"#,
         );
         let prompt: String = serde_json::from_str(&human).expect("policy returns a JSON string");
-        assert!(prompt.contains("channel 42"), "prompt names the channel: {prompt}");
-        assert!(prompt.contains("he1d1"), "prompt names the author: {prompt}");
-        assert!(prompt.contains("discord.send"), "prompt tells you how to reply: {prompt}");
+        assert!(
+            prompt.contains("channel 42"),
+            "prompt names the channel: {prompt}"
+        );
+        assert!(
+            prompt.contains("he1d1"),
+            "prompt names the author: {prompt}"
+        );
+        assert!(
+            prompt.contains("discord.send"),
+            "prompt tells you how to reply: {prompt}"
+        );
     }
 }
