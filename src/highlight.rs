@@ -118,6 +118,27 @@ impl CodeBlock {
     }
 }
 
+impl CodeSink for CodeBlock {
+    fn on_delta(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.line.push(ch);
+            if ch == '\n' {
+                self.flush_line();
+            }
+        }
+    }
+
+    fn on_retry(&mut self) {
+        // Discard whatever streamed from the failed attempt and start clean.
+        self.line.clear();
+        self.highlighter = HighlightLines::new(javascript_syntax(), theme());
+        if self.started {
+            eprintln!("{DIM}{}{RESET}", Self::border(false, "(retrying)"));
+            self.started = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BORDER_WIDTH, CodeBlock};
@@ -140,26 +161,5 @@ mod tests {
         assert!(bottom.starts_with("╰─"), "{bottom}");
         assert_eq!(bottom.chars().count(), BORDER_WIDTH);
         assert!(!bottom.contains(' '), "{bottom}");
-    }
-}
-
-impl CodeSink for CodeBlock {
-    fn on_delta(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.line.push(ch);
-            if ch == '\n' {
-                self.flush_line();
-            }
-        }
-    }
-
-    fn on_retry(&mut self) {
-        // Discard whatever streamed from the failed attempt and start clean.
-        self.line.clear();
-        self.highlighter = HighlightLines::new(javascript_syntax(), theme());
-        if self.started {
-            eprintln!("{DIM}{}{RESET}", Self::border(false, "(retrying)"));
-            self.started = false;
-        }
     }
 }

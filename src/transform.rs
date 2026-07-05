@@ -19,8 +19,8 @@
 
 use deno_ast::swc::ast::{
     AssignOp, AssignTarget, AssignTargetPat, Callee, Decl, Expr, ImportDecl, ImportSpecifier,
-    Module, ModuleDecl, ModuleExportName, ModuleItem, ObjectPatProp, Pat, SimpleAssignTarget,
-    Stmt, VarDeclKind,
+    Module, ModuleDecl, ModuleExportName, ModuleItem, ObjectPatProp, Pat, SimpleAssignTarget, Stmt,
+    VarDeclKind,
 };
 use deno_ast::{
     MediaType, ModuleSpecifier, ParseParams, ParsedSource, ProgramRef, SourceRangedForSpanned,
@@ -526,10 +526,7 @@ mod tests {
 
     #[test]
     fn declared_names_works_with_a_top_level_return() {
-        assert_eq!(
-            super::declared_names("const x = 1; return x;"),
-            vec!["x"]
-        );
+        assert_eq!(super::declared_names("const x = 1; return x;"), vec!["x"]);
     }
 
     /// A bare assignment creates a global exactly like a declaration does, so
