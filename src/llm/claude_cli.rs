@@ -26,17 +26,38 @@ impl LlmProvider for ClaudeCli {
     }
 }
 
+/// The directory the `claude` child runs in: a neutral, empty "project" under
+/// `~/.sdkmode`. The CLI injects per-project state — auto-memory, CLAUDE.md —
+/// keyed to its working directory, and `--setting-sources`/
+/// `--exclude-dynamic-system-prompt-sections` do not cover auto-memory. Run
+/// in the user's real project directory, the engine inherits *their* memory
+/// (names, notes, even memory-file instructions that fight the REPL's own
+/// seed). An empty project keeps the completion pure. (`--bare` would also
+/// skip auto-memory, but it restricts auth to API keys, breaking OAuth.)
+fn engine_dir() -> std::path::PathBuf {
+    let dir = crate::snapshot::dirs_home()
+        .map(|mut home| {
+            home.push(".sdkmode");
+            home.push("engine");
+            home
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Run `claude` once as a pure code-completion engine: its persona is fully
 /// replaced by the request's system prompt, dynamic context (git status, env)
-/// and project settings (CLAUDE.md, MCP servers) are excluded, and every
-/// built-in tool is off — so it can only emit the next step's source. Streams
-/// text deltas to `sink` and returns the full concatenated output plus the
-/// run's reported cost.
+/// and project settings (CLAUDE.md, MCP servers) are excluded, auto-memory is
+/// sidestepped by running in [`engine_dir`], and every built-in tool is off —
+/// so it can only emit the next step's source. Streams text deltas to `sink`
+/// and returns the full concatenated output plus the run's reported cost.
 async fn run_claude(
     request: &CompletionRequest<'_>,
     sink: &mut dyn CodeSink,
 ) -> anyhow::Result<RawCompletion> {
     let mut child = Command::new("claude")
+        .current_dir(engine_dir())
         .arg("-p")
         .arg("--output-format")
         .arg("stream-json") // stream tokens as they are generated
