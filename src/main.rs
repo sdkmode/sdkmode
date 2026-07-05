@@ -1,3 +1,4 @@
+mod discord_gateway;
 mod esm_loader;
 mod extensions;
 pub(crate) mod fetch;
@@ -8,7 +9,9 @@ mod mcp;
 mod repl;
 mod sandbox;
 pub(crate) mod sdk;
+mod snapshot;
 mod status;
+mod transcript;
 mod transform;
 
 fn main() {
@@ -21,6 +24,9 @@ fn main() {
 
     // Two front-ends share the same sandbox: an interactive REPL (the default)
     // and the MCP server (`sdkmode mcp`), used by agent clients over stdio.
+    // The REPL is the one interactive front-end; it also connects to Discord
+    // when SDKMODE_DISCORD_TOKEN is set (not a separate mode). `mcp` is the
+    // stdio server for agent clients.
     let mode = std::env::args().nth(1);
     let result = match mode.as_deref() {
         Some("mcp") => runtime.block_on(mcp::serve()),
