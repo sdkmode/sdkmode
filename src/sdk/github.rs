@@ -258,7 +258,9 @@ impl GitHubAuth {
     async fn token(&self) -> Result<String, JsErrorBox> {
         let mut guard = self.token.lock().await;
         if let Some(cached) = guard.as_ref()
-            && cached.expires_at.is_none_or(|expiry| Instant::now() < expiry)
+            && cached
+                .expires_at
+                .is_none_or(|expiry| Instant::now() < expiry)
         {
             return Ok(cached.value.clone());
         }
@@ -314,7 +316,9 @@ async fn app_installation_token(config: &AppConfig) -> Result<String, String> {
         .arg(&url)
         .output()
         .await
-        .map_err(|error| format!("failed to run curl for the GitHub App token exchange: {error}"))?;
+        .map_err(|error| {
+            format!("failed to run curl for the GitHub App token exchange: {error}")
+        })?;
 
     if !output.status.success() {
         return Err(format!(
@@ -331,9 +335,8 @@ async fn app_installation_token(config: &AppConfig) -> Result<String, String> {
 fn mint_app_jwt(app_id: &str, key_path: &str) -> Result<String, String> {
     let pem = std::fs::read(key_path)
         .map_err(|error| format!("cannot read GitHub App key at {key_path}: {error}"))?;
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(&pem).map_err(|error| {
-        format!("GitHub App key at {key_path} is not a valid RSA PEM: {error}")
-    })?;
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(&pem)
+        .map_err(|error| format!("GitHub App key at {key_path} is not a valid RSA PEM: {error}"))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -369,8 +372,8 @@ fn installation_token_from_response(raw: &str) -> Result<String, String> {
         ));
     }
 
-    let value: serde_json::Value =
-        serde_json::from_str(body).map_err(|error| format!("unparseable token response: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("unparseable token response: {error}"))?;
     value
         .get("token")
         .and_then(|token| token.as_str())
@@ -456,8 +459,8 @@ fn app_bot_login_from_response(raw: &str) -> Result<String, String> {
     if code != "200" {
         return Err(format!("GET /app failed (HTTP {code}): {body}"));
     }
-    let value: serde_json::Value =
-        serde_json::from_str(body).map_err(|error| format!("unparseable /app response: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("unparseable /app response: {error}"))?;
     value
         .get("slug")
         .and_then(|slug| slug.as_str())
@@ -549,7 +552,8 @@ mod tests {
         let login = app_bot_login_from_response("{\"slug\":\"sdkmode\",\"id\":42}\n200").unwrap();
         assert_eq!(login, "sdkmode[bot]");
 
-        let err = app_bot_login_from_response("{\"message\":\"Bad credentials\"}\n401").unwrap_err();
+        let err =
+            app_bot_login_from_response("{\"message\":\"Bad credentials\"}\n401").unwrap_err();
         assert!(err.contains("HTTP 401"), "unexpected: {err}");
     }
 
@@ -582,8 +586,8 @@ mod tests {
         .unwrap();
         assert_eq!(ok, "ghs_abc");
 
-        let err = installation_token_from_response("{\"message\":\"Bad credentials\"}\n401")
-            .unwrap_err();
+        let err =
+            installation_token_from_response("{\"message\":\"Bad credentials\"}\n401").unwrap_err();
         assert!(err.contains("HTTP 401"), "unexpected: {err}");
         assert!(err.contains("Bad credentials"), "body not surfaced: {err}");
     }
