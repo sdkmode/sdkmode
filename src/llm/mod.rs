@@ -283,20 +283,26 @@ fn comment_line(line: &str) -> String {
 mod tests {
     use super::{build_system_prompt, extract_code};
 
-    /// The assembled prompt must mention every import specifier an SDK grants
-    /// and every SDK bullet, or the model would never learn to use them.
+    /// The assembled prompt must mention every *model-facing* import specifier
+    /// (those with a non-empty `import_blurb`) and every SDK bullet, so the
+    /// model can learn to use each capability. An SDK whose package is only
+    /// imported by its own shim (e.g. discord/discordeno) carries an empty
+    /// blurb and is documented through its bullet instead, not the allowlist.
     #[test]
     fn system_prompt_covers_every_sdk() {
         let prompt = build_system_prompt();
         for sdk in crate::sdk::registry() {
-            for (specifier, _url) in sdk.imports() {
-                assert!(
-                    prompt.contains(specifier),
-                    "system prompt does not mention import {specifier:?} ({})",
-                    sdk.name()
-                );
+            let docs = sdk.docs();
+            if !docs.import_blurb.is_empty() {
+                for (specifier, _url) in sdk.imports() {
+                    assert!(
+                        prompt.contains(specifier),
+                        "system prompt does not mention import {specifier:?} ({})",
+                        sdk.name()
+                    );
+                }
             }
-            if let Some(bullet) = sdk.docs().system_prompt {
+            if let Some(bullet) = docs.system_prompt {
                 assert!(
                     prompt.contains(bullet),
                     "system prompt is missing the {} bullet",

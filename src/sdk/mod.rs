@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 pub(crate) mod browser;
+pub(crate) mod discord;
 pub(crate) mod files;
 pub(crate) mod git;
 pub(crate) mod github;
@@ -105,6 +106,7 @@ pub(crate) fn registry() -> Vec<Arc<dyn Sdk>> {
         Arc::new(files::Files),
         Arc::new(git::Git),
         Arc::new(browser::Browser),
+        Arc::new(discord::Discord::new()),
     ]
 }
 
@@ -128,8 +130,11 @@ pub(crate) fn allowed_imports() -> Vec<(String, String)> {
 }
 
 /// Join blurbs into a natural-language list: "a", "a and b", "a, b, and c".
+/// Empty items are skipped — an SDK with no packages (e.g. discord, which is
+/// pure `fetch`) contributes nothing to an allowlist sentence.
 pub(crate) fn oxford_join(items: &[&str]) -> String {
-    match items {
+    let items: Vec<&str> = items.iter().copied().filter(|i| !i.is_empty()).collect();
+    match items.as_slice() {
         [] => String::new(),
         [only] => (*only).to_string(),
         [a, b] => format!("{a} and {b}"),
@@ -194,5 +199,7 @@ mod tests {
         assert_eq!(oxford_join(&["a"]), "a");
         assert_eq!(oxford_join(&["a", "b"]), "a and b");
         assert_eq!(oxford_join(&["a", "b", "c"]), "a, b, and c");
+        // Package-less SDKs (empty blurbs) leave no trace in the sentence.
+        assert_eq!(oxford_join(&["a", "", "b"]), "a and b");
     }
 }
