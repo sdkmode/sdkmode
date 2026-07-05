@@ -98,8 +98,7 @@ impl Transcript {
         for item in items {
             let obj = item.as_object()?;
             let id = obj.get("id")?.as_u64()?;
-            let text =
-                |key: &str| obj.get(key).and_then(|v| v.as_str()).map(str::to_string);
+            let text = |key: &str| obj.get(key).and_then(|v| v.as_str()).map(str::to_string);
             let kind = match obj.get("type").and_then(|v| v.as_str())? {
                 "user" => EntryKind::User(text("text")?),
                 "step" => EntryKind::Step {
@@ -141,14 +140,18 @@ impl Transcript {
         };
 
         // Names declared before any edit or deletion is applied.
-        let mut doomed: Vec<String> =
-            self.entries.iter().flat_map(step_declared_names).collect();
+        let mut doomed: Vec<String> = self.entries.iter().flat_map(step_declared_names).collect();
 
-        let mut removed: HashMap<u64, Entry> =
-            self.entries.drain(..).map(|entry| (entry.id, entry)).collect();
+        let mut removed: HashMap<u64, Entry> = self
+            .entries
+            .drain(..)
+            .map(|entry| (entry.id, entry))
+            .collect();
         let mut kept: Vec<Entry> = Vec::with_capacity(items.len());
         for item in items {
-            let Some(obj) = item.as_object() else { continue };
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
             let known = obj
                 .get("id")
                 .and_then(|v| v.as_u64())
@@ -166,9 +169,7 @@ impl Transcript {
                         .get("text")
                         .and_then(|v| v.as_str())
                         .map(str::to_string)
-                        .unwrap_or_else(|| {
-                            serde_json::Value::Object(obj.clone()).to_string()
-                        });
+                        .unwrap_or_else(|| serde_json::Value::Object(obj.clone()).to_string());
                     let id = self.next_id;
                     self.next_id += 1;
                     kept.push(Entry {
@@ -198,8 +199,7 @@ impl Transcript {
     /// Every name the transcript's steps still declare, minus the harness's
     /// own globals — the set worth snapshotting between turns.
     pub fn persistable_names(&self) -> Vec<String> {
-        let mut names: Vec<String> =
-            self.entries.iter().flat_map(step_declared_names).collect();
+        let mut names: Vec<String> = self.entries.iter().flat_map(step_declared_names).collect();
         names.sort();
         names.dedup();
         names.retain(|name| !PROTECTED_GLOBALS.contains(&name.as_str()));
@@ -310,7 +310,11 @@ mod tests {
         context.as_array_mut().unwrap()[0]["code"] =
             serde_json::json!("// summarized: counted the fetch\ncount = 42;");
         let doomed = transcript.reconcile(&read_back(7, context), 7);
-        assert_eq!(doomed, vec!["bulk"], "count is kept by the summary's assignment");
+        assert_eq!(
+            doomed,
+            vec!["bulk"],
+            "count is kept by the summary's assignment"
+        );
     }
 
     #[test]
@@ -326,7 +330,11 @@ mod tests {
     #[test]
     fn protected_globals_are_never_deallocated() {
         let mut transcript = Transcript::new();
-        transcript.push_step("let octokit = 1; let mine = 2;".to_string(), String::new(), None);
+        transcript.push_step(
+            "let octokit = 1; let mine = 2;".to_string(),
+            String::new(),
+            None,
+        );
         let doomed = transcript.reconcile(&read_back(7, serde_json::json!([])), 7);
         assert_eq!(doomed, vec!["mine"]);
     }
@@ -336,7 +344,11 @@ mod tests {
         let mut transcript = sample();
         let doomed = transcript.reconcile(&read_back(6, serde_json::json!([])), 7);
         assert!(doomed.is_empty());
-        assert_eq!(transcript.entries.len(), 3, "stale read-back must be ignored");
+        assert_eq!(
+            transcript.entries.len(),
+            3,
+            "stale read-back must be ignored"
+        );
     }
 
     #[test]

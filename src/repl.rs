@@ -472,8 +472,7 @@ async fn run_turn(
             .borrow_mut()
             .update(&status_note("running", steps, cost_usd));
         let serial = CTX_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let executable =
-            build_executable(latest, &code, &transcript.to_json().to_string(), serial);
+        let executable = build_executable(latest, &code, &transcript.to_json().to_string(), serial);
         let eval_result = {
             let fut = session.eval(executable);
             tokio::pin!(fut);
@@ -585,7 +584,12 @@ fn fmt_tokens(tokens: usize) -> String {
 /// 4k/50k)` — so cost and context pressure are visible without setting
 /// `SDKMODE_METRICS`. Stays on stderr with the rest of the working noise;
 /// plain when stderr is piped.
-fn print_turn_summary(steps: usize, cost_usd: f64, elapsed: std::time::Duration, ctx_tokens: usize) {
+fn print_turn_summary(
+    steps: usize,
+    cost_usd: f64,
+    elapsed: std::time::Duration,
+    ctx_tokens: usize,
+) {
     use std::io::IsTerminal;
     if steps == 0 {
         return;
@@ -706,7 +710,9 @@ fn restore_session(transcript: &mut Transcript, session: &mut sandbox::Session) 
         transcript.push_note(lines.join("\n"));
     }
 
-    print_aside(&format!("(resumed {message_count} messages from the previous session)"));
+    print_aside(&format!(
+        "(resumed {message_count} messages from the previous session)"
+    ));
 }
 
 /// Snapshot the session after a turn: the transcript plus the current values
@@ -868,7 +874,8 @@ async fn run_interactive(
         }
         #[cfg(not(unix))]
         {
-            should_quit = run_turn(&mut latest, transcript, session, llm, Some(&mut inbox_rx)).await;
+            should_quit =
+                run_turn(&mut latest, transcript, session, llm, Some(&mut inbox_rx)).await;
         }
 
         save_session(transcript, session);
