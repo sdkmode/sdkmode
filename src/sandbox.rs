@@ -278,8 +278,8 @@ fn bootstrap_runtime(
 
 /// Read a `globalThis` string expression out of the runtime, coercing to a
 /// string. Returns an empty string if evaluation fails.
-fn read_global_string(runtime: &mut deno_core::JsRuntime, expr: &'static str) -> String {
-    let Ok(value) = runtime.execute_script("[sdkmode:read]", expr) else {
+fn read_global_string(runtime: &mut deno_core::JsRuntime, expr: impl Into<String>) -> String {
+    let Ok(value) = runtime.execute_script("[sdkmode:read]", expr.into()) else {
         return String::new();
     };
 
@@ -372,16 +372,25 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
             sys_traits::impls::RealSys,
         ));
 
-        // Least privilege: the guest may read the working directory and use the
-        // network (the fetch broker handles credentials and SSRF blocking).
-        // Everything else — env, fs writes, subprocess, FFI, system info — is
-        // denied. Credentials live host-side, so this does not affect SDK auth.
+        // Least privilege: the guest may read and write the working directory
+        // and the archive (where the agent files away pruned context — see
+        // `crate::snapshot::archive_dir`), and use the network (the fetch
+        // broker handles credentials and SSRF blocking). Everything else —
+        // env, other paths, subprocess, FFI, system info — is denied.
+        // Credentials live host-side, so this does not affect SDK auth.
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".to_string());
+        let mut allow_paths = vec![cwd];
+        if let Some(archive) = crate::snapshot::archive_dir() {
+            // Best-effort: a failure here just means archive writes will be
+            // denied like any other out-of-cwd path.
+            let _ = std::fs::create_dir_all(&archive);
+            allow_paths.push(archive.to_string_lossy().into_owned());
+        }
         let options = deno_runtime::deno_permissions::PermissionsOptions {
-            allow_read: Some(vec![cwd.clone()]),
-            allow_write: Some(vec![cwd]),
+            allow_read: Some(allow_paths.clone()),
+            allow_write: Some(allow_paths),
             allow_net: Some(vec![]), // all hosts; gated by the fetch broker
             ..Default::default()
         };
@@ -604,6 +613,23 @@ impl Session {
             error,
             value,
         })
+    }
+
+    /// Evaluate a synchronous host-side expression — the `context` read-back,
+    /// snapshot collection, the sandbox's clock — and coerce the result to a
+    /// string (empty on failure). Never used for model-written code; steps go
+    /// through [`Session::eval`] with its watchdog and scratchpad handling.
+    pub fn read_to_string(&mut self, expr: impl Into<String>) -> String {
+        read_global_string(&mut self.runtime, expr)
+    }
+
+    /// Run a synchronous host-side script for its effects — restoring
+    /// snapshot variables, deallocating a deleted step's bindings.
+    pub fn run_host_script(&mut self, script: impl Into<String>) -> Result<(), anyhow::Error> {
+        self.runtime
+            .execute_script("[sdkmode:host]", script.into())
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("host script failed: {error}"))
     }
 }
 
