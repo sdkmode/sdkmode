@@ -42,11 +42,19 @@ jobs:
           asset="sdkmode-${{ github.ref_name }}-${{ matrix.target }}"
           cp target/release/sdkmode "$asset"
           strip "$asset"
+          # Publish a SHA-256 next to each binary so install.sh can verify the
+          # download (format matches `sha256sum -c` / `shasum -a 256 -c`).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: sdkmode-${{ github.ref_name }}-${{ matrix.target }}
+          # Upload the binary and its checksum together.
+          path: sdkmode-${{ github.ref_name }}-${{ matrix.target }}*
 
   # Generate the changelog and publish the release with both binaries attached.
   release:

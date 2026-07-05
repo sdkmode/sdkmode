@@ -15,7 +15,7 @@ Prerequisites:
   - cargo build --release           # builds ./target/release/sdkmode
 
 Usage:
-  python3 benchmark.py [--repeats N] [--concurrency N] [--task NAME ...]
+  python3 benchmark.py [--repeats N] [--concurrency N] [--task NAME ...] [--agent NAME ...]
 """
 
 from __future__ import annotations
@@ -414,11 +414,14 @@ async def main() -> None:
                         help="Max runs at once (default: 4). Use 1 for sequential.")
     parser.add_argument("--task", action="append", choices=list(TASKS),
                         help="Limit to specific task(s); repeatable. Default: all.")
+    parser.add_argument("--agent", action="append", choices=list(TRIALS),
+                        help="Limit to specific agent(s); repeatable. Default: all.")
     args = parser.parse_args()
 
     tasks = {name: TASKS[name] for name in (args.task or TASKS)}
+    trials = {name: TRIALS[name] for name in (args.agent or TRIALS)}
     runs: dict[str, dict[str, list[dict]]] = {
-        t: {trial: [] for trial in TRIALS} for t in tasks
+        t: {trial: [] for trial in trials} for t in tasks
     }
     semaphore = asyncio.Semaphore(max(1, args.concurrency))
 
@@ -430,11 +433,14 @@ async def main() -> None:
             except Exception as error:
                 print(f"{task_name} / {trial_name} ({i + 1}/{args.repeats}): setup failed: {error}")
                 return
+            # Bound up front so a runner exception can't leave them undefined
+            # and raise NameError below (which would abort the whole gather).
+            result = {"answer": "", "cost": None, "duration_s": 0.0, "error": True}
+            correct = False
             try:
                 prompt = task.prompt.format(**ctx) if ctx else task.prompt
                 cwd = task.cwd(ctx) if task.cwd else None
                 result = await runner(prompt, cwd)
-                correct = False
                 if not result["error"]:
                     try:
                         if task.check:
@@ -444,6 +450,8 @@ async def main() -> None:
                             correct = verify(result["answer"], truth, task.kind)
                     except Exception:
                         correct = False  # verification failed; can't credit it
+            except Exception as error:
+                print(f"{task_name} / {trial_name} ({i + 1}/{args.repeats}): run failed: {error}")
             finally:
                 if task.teardown:
                     try:
@@ -462,7 +470,7 @@ async def main() -> None:
     jobs = [
         one_run(task_name, task, trial_name, runner, i)
         for task_name, task in tasks.items()
-        for trial_name, runner in TRIALS.items()
+        for trial_name, runner in trials.items()
         for i in range(args.repeats)
     ]
     await asyncio.gather(*jobs)

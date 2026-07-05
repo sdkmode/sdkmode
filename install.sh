@@ -52,13 +52,44 @@ url="https://github.com/$REPO/releases/download/$tag/$asset"
 
 info "Installing $BIN $tag ($target)..."
 tmp=$(mktemp "${TMPDIR:-/tmp}/sdkmode.XXXXXX") || err "could not create a temp file"
-trap 'rm -f "$tmp"' EXIT
+sum=$(mktemp "${TMPDIR:-/tmp}/sdkmode.XXXXXX") || err "could not create a temp file"
+trap 'rm -f "$tmp" "$sum"' EXIT
 curl -fSL --progress-bar "$url" -o "$tmp" || err "download failed: $url"
+
+# Best-effort SHA-256 integrity check. The release is expected to publish a
+# "<asset>.sha256" alongside each binary (this depends on the release workflow
+# producing those files; older releases predate them). Behaviour:
+#   - checksum file present + matches  -> proceed
+#   - checksum file present + mismatch -> hard fail (fail-closed)
+#   - checksum file absent             -> warn and proceed (backward compat)
+#   - no sha256 tool available         -> warn and proceed
+if curl -fsSL "$url.sha256" -o "$sum" 2>/dev/null; then
+  # The expected digest is the first whitespace-delimited field (handles both
+  # bare digests and "<digest>  <filename>" formats).
+  expected=$(cut -d' ' -f1 "$sum" | head -n1)
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp" | cut -d' ' -f1)
+  elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp" | cut -d' ' -f1)
+  else
+    actual=""
+    info "warning: no sha256sum/shasum found; skipping checksum verification"
+  fi
+  if [ -n "$actual" ]; then
+    [ "$expected" = "$actual" ] \
+      || err "checksum mismatch for $asset (expected $expected, got $actual)"
+    info "Checksum verified."
+  fi
+else
+  info "warning: no published checksum for this release; skipping verification"
+fi
+
 chmod +x "$tmp"
 
 mkdir -p "$INSTALL_DIR" || err "could not create $INSTALL_DIR"
 mv "$tmp" "$INSTALL_DIR/$BIN" \
   || err "could not write to $INSTALL_DIR (set SDKMODE_INSTALL_DIR, or re-run with sudo)"
+rm -f "$sum"
 trap - EXIT
 
 info "Installed $BIN to $INSTALL_DIR/$BIN"

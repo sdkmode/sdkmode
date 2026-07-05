@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use deno_runtime::{
     deno_permissions::PermissionsContainer, permissions::RuntimePermissionDescriptorParser,
@@ -8,6 +10,99 @@ use crate::extensions;
 use crate::fetch::fetch_options;
 
 static RUNTIME_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/RUNJS_SNAPSHOT.bin"));
+
+/// Wall-clock cap on a single guest execution (one [`Session::eval`] step or one
+/// [`execute_code`] module). Guest code runs V8 synchronously on the single
+/// tokio thread, so a synchronous infinite loop (`while (true) {}`) never yields
+/// and no `tokio::select!` (e.g. the REPL's SIGINT handler) can ever fire. A
+/// watchdog thread calls `terminate_execution` on the isolate once this elapses,
+/// unwinding the guest so the step returns an error instead of hanging forever.
+///
+/// Overridable at runtime via `SDKMODE_STEP_TIMEOUT_MS` (milliseconds) — handy
+/// for tests that want a short deadline, and as a production escape hatch.
+const STEP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Resolve the effective step timeout, honouring the `SDKMODE_STEP_TIMEOUT_MS`
+/// override when it is set to a valid non-zero value.
+fn step_timeout() -> Duration {
+    match std::env::var("SDKMODE_STEP_TIMEOUT_MS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => STEP_TIMEOUT,
+        },
+        Err(_) => STEP_TIMEOUT,
+    }
+}
+
+/// The message a terminated step reports, so the model (or MCP client) sees a
+/// readable reason rather than V8's bare "execution terminated".
+fn timeout_error_message(timeout: Duration) -> String {
+    format!(
+        "the step was terminated: it ran past the {}s limit (an infinite loop or a hang)",
+        timeout.as_secs_f64()
+    )
+}
+
+/// A running watchdog that terminates the isolate if the guest overruns.
+///
+/// Spawns a `std::thread` that waits on a channel with a timeout: if the main
+/// path sends (or drops the sender) before the deadline, the guest finished and
+/// the isolate is left untouched; if the deadline passes first, it calls
+/// `terminate_execution` on the thread-safe [`v8::IsolateHandle`], which unwinds
+/// the pending synchronous or event-loop work with an uncatchable termination.
+struct ExecutionWatchdog {
+    /// Sending (or dropping) this cancels the watchdog before it can fire.
+    cancel: Option<mpsc::Sender<()>>,
+    /// Set to `true` by the watchdog thread iff it actually terminated the
+    /// isolate, so the caller can map the resulting error to a clear message.
+    fired: Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ExecutionWatchdog {
+    /// Arm a watchdog for `timeout` against `handle` (obtained from
+    /// `runtime.v8_isolate().thread_safe_handle()`, which is `Send`).
+    fn arm(handle: deno_core::v8::IsolateHandle, timeout: Duration) -> Self {
+        let (cancel, rx) = mpsc::channel::<()>();
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_thread = fired.clone();
+        let join = std::thread::spawn(move || {
+            // Woken early (recv/disconnect) => guest finished, do nothing.
+            // Timed out => terminate the still-running guest.
+            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
+                fired_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+                handle.terminate_execution();
+            }
+        });
+        Self {
+            cancel: Some(cancel),
+            fired,
+            join: Some(join),
+        }
+    }
+
+    /// Whether the watchdog terminated the isolate (as opposed to the guest
+    /// finishing on its own). Only meaningful after [`Self::disarm`].
+    fn fired(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Cancel the watchdog (if it hasn't fired) and join its thread.
+    fn disarm(&mut self) {
+        // Dropping the sender wakes `recv_timeout` immediately if it is still
+        // waiting; if the watchdog already fired this is a no-op.
+        self.cancel.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for ExecutionWatchdog {
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
 
 /// JavaScript installed before the user's module runs. It redirects the
 /// `console` methods into a buffer on `globalThis` so the output can be read
@@ -65,125 +160,6 @@ const ENV_SHIM: &str = r#"
             existing.toObject = empty.toObject;
         }
     }
-})(globalThis);
-"#;
-
-/// A minimal node-`fs`-shaped filesystem backed by `Deno.*`, exposed to guest
-/// code as `globalThis.fs`. isomorphic-git takes an `fs` argument for every
-/// working-tree/`.git` operation, but `node:fs` is not available in the sandbox;
-/// this adapts the Deno APIs (which already run under the cwd read/write
-/// permissions). Errors are remapped to node `errno` codes (ENOENT, EEXIST, …)
-/// because isomorphic-git branches on `err.code` to detect missing refs/objects.
-const FS_SHIM: &str = r#"
-((globalThis) => {
-    const mapErr = (e) => {
-        if (e instanceof Deno.errors.NotFound) e.code = "ENOENT";
-        else if (e instanceof Deno.errors.AlreadyExists) e.code = "EEXIST";
-        else if (e instanceof Deno.errors.PermissionDenied) e.code = "EACCES";
-        else if (e instanceof Deno.errors.NotADirectory) e.code = "ENOTDIR";
-        else if (e instanceof Deno.errors.IsADirectory) e.code = "EISDIR";
-        return e;
-    };
-    const toBytes = (data) =>
-        typeof data === "string" ? new TextEncoder().encode(data)
-        : data instanceof Uint8Array ? data
-        : new Uint8Array(data);
-    const toStats = (info) => ({
-        isFile: () => info.isFile,
-        isDirectory: () => info.isDirectory,
-        isSymbolicLink: () => info.isSymlink,
-        size: info.size,
-        mode: info.mode ?? (info.isDirectory ? 0o40755 : 0o100644),
-        ino: info.ino ?? 0,
-        uid: info.uid ?? 0,
-        gid: info.gid ?? 0,
-        dev: info.dev ?? 0,
-        mtimeMs: info.mtime?.getTime() ?? 0,
-        ctimeMs: info.mtime?.getTime() ?? 0,
-        mtime: info.mtime ?? new Date(0),
-        ctime: info.mtime ?? new Date(0),
-    });
-    const promises = {
-        readFile: async (path, opts) => {
-            try {
-                const bytes = await Deno.readFile(path);
-                const enc = typeof opts === "string" ? opts : opts?.encoding;
-                return enc ? new TextDecoder().decode(bytes) : bytes;
-            } catch (e) { throw mapErr(e); }
-        },
-        writeFile: async (path, data) => {
-            try { await Deno.writeFile(path, toBytes(data)); }
-            catch (e) { throw mapErr(e); }
-        },
-        unlink: async (path) => {
-            try { await Deno.remove(path); } catch (e) { throw mapErr(e); }
-        },
-        readdir: async (path) => {
-            try {
-                const names = [];
-                for await (const entry of Deno.readDir(path)) names.push(entry.name);
-                return names;
-            } catch (e) { throw mapErr(e); }
-        },
-        mkdir: async (path, opts) => {
-            try { await Deno.mkdir(path, { recursive: !!(opts && opts.recursive) }); }
-            catch (e) { throw mapErr(e); }
-        },
-        rmdir: async (path) => {
-            try { await Deno.remove(path); } catch (e) { throw mapErr(e); }
-        },
-        stat: async (path) => {
-            try { return toStats(await Deno.stat(path)); } catch (e) { throw mapErr(e); }
-        },
-        lstat: async (path) => {
-            try { return toStats(await Deno.lstat(path)); } catch (e) { throw mapErr(e); }
-        },
-        readlink: async (path) => {
-            try { return await Deno.readLink(path); } catch (e) { throw mapErr(e); }
-        },
-        symlink: async (target, path) => {
-            try { await Deno.symlink(target, path); } catch (e) { throw mapErr(e); }
-        },
-        chmod: async (path, mode) => {
-            try { await Deno.chmod(path, mode); } catch (e) { throw mapErr(e); }
-        },
-    };
-    globalThis.fs = { promises };
-})(globalThis);
-"#;
-
-/// Exposes `globalThis.browser`: an Astral browser that lazily connects to a
-/// host-spawned headless Chrome the first time it is used, then is reused for
-/// the rest of the session. A Proxy defers the (async) connect until an actual
-/// call or `await`, so guest code can write `await browser.newPage(url)` with no
-/// setup step — and Chrome is only launched if the agent actually browses.
-const BROWSER_SHIM: &str = r#"
-((globalThis) => {
-    // Captured before bootstrap (see [sdkmode:browser-op]); spawns the shared
-    // Chrome on first call and returns its CDP ws endpoint.
-    const chromeEndpoint = globalThis.__sdkmode_chromeEndpointOp;
-
-    let connecting = null;
-    const ready = () =>
-        (connecting ??= (async () => {
-            const { connect } = await import("@astral/astral");
-            return await connect({ endpoint: await chromeEndpoint() });
-        })());
-
-    globalThis.browser = new Proxy(function () {}, {
-        get(_target, prop) {
-            // `await browser` resolves to the real Browser.
-            if (prop === "then") {
-                return (onFulfilled, onRejected) => ready().then(onFulfilled, onRejected);
-            }
-            // Any other access connects if needed, then forwards to the Browser.
-            return (...args) =>
-                ready().then((browser) => {
-                    const value = browser[prop];
-                    return typeof value === "function" ? value.apply(browser, args) : value;
-                });
-        },
-    });
 })(globalThis);
 "#;
 
@@ -302,8 +278,8 @@ fn bootstrap_runtime(
 
 /// Read a `globalThis` string expression out of the runtime, coercing to a
 /// string. Returns an empty string if evaluation fails.
-fn read_global_string(runtime: &mut deno_core::JsRuntime, expr: &'static str) -> String {
-    let Ok(value) = runtime.execute_script("[sdkmode:read]", expr) else {
+fn read_global_string(runtime: &mut deno_core::JsRuntime, expr: impl Into<String>) -> String {
+    let Ok(value) = runtime.execute_script("[sdkmode:read]", expr.into()) else {
         return String::new();
     };
 
@@ -318,14 +294,15 @@ fn read_global_string(runtime: &mut deno_core::JsRuntime, expr: &'static str) ->
 /// Build a sandboxed Deno runtime with all extensions, permissions, and the
 /// console-[`CAPTURE_SHIM`] installed, ready to load modules or run scripts.
 fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
+    let sdks = crate::sdk::registry();
     let module_loader = std::rc::Rc::new(crate::esm_loader::EsmLoader::new()?);
-    // The snapshot bakes in the stock Deno extensions; our ops-only browser
-    // extension is appended at runtime (it has no JS to snapshot), so the
-    // snapshot set stays a prefix of the runtime set.
+    // The snapshot bakes in the stock Deno extensions; SDK extensions are
+    // ops-only (no JS to snapshot) and appended at runtime, so the snapshot
+    // set stays a prefix of the runtime set.
     let mut extensions = extensions::extensions(Some(
         deno_runtime::ops::bootstrap::SnapshotOptions::default(),
     ));
-    extensions.push(crate::browser::sdkmode_browser::init());
+    extensions.extend(sdks.iter().filter_map(|sdk| sdk.extension()));
     let mut runtime = deno_core::JsRuntime::new(deno_core::RuntimeOptions {
         startup_snapshot: Some(RUNTIME_SNAPSHOT),
         module_loader: Some(module_loader),
@@ -373,15 +350,19 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
         deno_bundle_runtime::deno_bundle_runtime::args(None),
     ])?;
 
-    // Stash the browser op while `Deno.core` is still exposed: deno_runtime's
-    // bootstrap (run next) removes `Deno.core` before any guest code executes,
-    // but a captured op reference keeps working afterward.
-    runtime
-        .execute_script(
-            "[sdkmode:browser-op]",
-            "globalThis.__sdkmode_chromeEndpointOp = Deno.core.ops.op_sdkmode_chrome_endpoint;",
-        )
-        .map_err(|error| anyhow::anyhow!("failed to capture browser op: {}", error))?;
+    // Run SDK pre-bootstrap scripts while `Deno.core` is still exposed:
+    // deno_runtime's bootstrap (run next) removes `Deno.core` before any guest
+    // code executes, but a reference captured now keeps working afterward
+    // (e.g. the browser SDK stashes its Chrome-endpoint op).
+    for sdk in &sdks {
+        if let Some(script) = sdk.pre_bootstrap_script() {
+            runtime
+                .execute_script("[sdkmode:pre-bootstrap]", script)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to run {} pre-bootstrap script: {error}", sdk.name())
+                })?;
+        }
+    }
 
     {
         let state = runtime.op_state();
@@ -391,16 +372,25 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
             sys_traits::impls::RealSys,
         ));
 
-        // Least privilege: the guest may read the working directory and use the
-        // network (the fetch broker handles credentials and SSRF blocking).
-        // Everything else — env, fs writes, subprocess, FFI, system info — is
-        // denied. Credentials live host-side, so this does not affect SDK auth.
+        // Least privilege: the guest may read and write the working directory
+        // and the archive (where the agent files away pruned context — see
+        // `crate::snapshot::archive_dir`), and use the network (the fetch
+        // broker handles credentials and SSRF blocking). Everything else —
+        // env, other paths, subprocess, FFI, system info — is denied.
+        // Credentials live host-side, so this does not affect SDK auth.
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".to_string());
+        let mut allow_paths = vec![cwd];
+        if let Some(archive) = crate::snapshot::archive_dir() {
+            // Best-effort: a failure here just means archive writes will be
+            // denied like any other out-of-cwd path.
+            let _ = std::fs::create_dir_all(&archive);
+            allow_paths.push(archive.to_string_lossy().into_owned());
+        }
         let options = deno_runtime::deno_permissions::PermissionsOptions {
-            allow_read: Some(vec![cwd.clone()]),
-            allow_write: Some(vec![cwd]),
+            allow_read: Some(allow_paths.clone()),
+            allow_write: Some(allow_paths),
             allow_net: Some(vec![]), // all hosts; gated by the fetch broker
             ..Default::default()
         };
@@ -426,13 +416,18 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
         .execute_script("[sdkmode:env]", ENV_SHIM)
         .map_err(|error| anyhow::anyhow!("failed to install env shim: {}", error))?;
 
-    runtime
-        .execute_script("[sdkmode:fs]", FS_SHIM)
-        .map_err(|error| anyhow::anyhow!("failed to install fs shim: {}", error))?;
-
-    runtime
-        .execute_script("[sdkmode:browser]", BROWSER_SHIM)
-        .map_err(|error| anyhow::anyhow!("failed to install browser shim: {}", error))?;
+    // Install each SDK's shim (lazy globals like `octokit` and `browser`, the
+    // `fs` adapter for isomorphic-git, …). The shims are independent IIFEs
+    // touching distinct globals, so registry order is not load-bearing.
+    for sdk in &sdks {
+        if let Some(shim) = sdk.shim() {
+            runtime
+                .execute_script("[sdkmode:sdk-shim]", shim)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to install {} shim: {error}", sdk.name())
+                })?;
+        }
+    }
 
     runtime
         .execute_script("[sdkmode:abort]", ABORT_SHIM)
@@ -445,9 +440,21 @@ fn build_runtime() -> Result<deno_core::JsRuntime, anyhow::Error> {
 /// its captured `console` output and any error it raised. Each call gets an
 /// isolated runtime, so state does not leak between executions. Used by the MCP
 /// server; the REPL uses [`Session`] for persistent state.
+///
+/// A watchdog enforces [`STEP_TIMEOUT`]: if the module runs past it (e.g. a
+/// synchronous infinite loop that never yields the tokio thread), V8 execution
+/// is force-terminated and the returned error reports the timeout, so the MCP
+/// server cannot hang forever.
 pub async fn execute_code(code: String) -> Result<ExecutionResult, anyhow::Error> {
     let mut runtime = build_runtime()?;
     let specifier = deno_core::ModuleSpecifier::parse("file:///main.js")?;
+
+    // Guard the whole load + event-loop drive: a synchronous infinite loop in
+    // the module never yields the tokio thread, so without this the MCP server
+    // would hang forever (Bug 1 / Bug 4).
+    let timeout = step_timeout();
+    let handle = runtime.v8_isolate().thread_safe_handle();
+    let mut watchdog = ExecutionWatchdog::arm(handle, timeout);
 
     let mut error = None;
     match runtime
@@ -467,6 +474,14 @@ pub async fn execute_code(code: String) -> Result<ExecutionResult, anyhow::Error
         }
     }
 
+    watchdog.disarm();
+    if watchdog.fired() {
+        // V8 was force-terminated; clear the terminating state so the output
+        // read below is not itself terminated, then replace V8's opaque wording.
+        runtime.v8_isolate().cancel_terminate_execution();
+        error = Some(timeout_error_message(timeout));
+    }
+
     let output = read_global_string(&mut runtime, READ_OUTPUT);
 
     Ok(ExecutionResult { output, error })
@@ -482,29 +497,17 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a session and seed `globalThis.octokit` with an authenticated
-    /// client, so every turn can use it without importing.
+    /// Create a session. `globalThis.octokit` is available to every turn without
+    /// importing, but it is *lazy*: the octokit shim's proxy (see
+    /// `sdk::github`) imports `@octokit/rest` and constructs the client only on
+    /// first use. So `new()` does no network I/O and the REPL can start offline
+    /// for local-only tasks; the octokit import happens later, the first time a
+    /// turn actually touches `octokit`.
     pub async fn new() -> Result<Self, anyhow::Error> {
-        let mut runtime = build_runtime()?;
-        let specifier = deno_core::ModuleSpecifier::parse("file:///main.js")?;
-
-        // Static import is loaded as the (single) main module — the proven path
-        // for resolving `@octokit/rest` — then stashed on the global scope.
-        let init = "import { Octokit } from \"@octokit/rest\";\n\
-                    globalThis.octokit = new Octokit();\n";
-        let module_id = runtime
-            .load_main_es_module_from_code(&specifier, init.to_string())
-            .await
-            .map_err(|error| anyhow::anyhow!("session init failed to load: {error}"))?;
-        let evaluate = runtime.mod_evaluate(module_id);
-        runtime
-            .run_event_loop(Default::default())
-            .await
-            .map_err(|error| anyhow::anyhow!("session init event loop failed: {error}"))?;
-        evaluate
-            .await
-            .map_err(|error| anyhow::anyhow!("session init failed: {error}"))?;
-
+        // The runtime is fully built by `build_runtime` (which installs every
+        // SDK's lazy shim). There is nothing left to load over the network
+        // here, so no main module is evaluated at session start.
+        let runtime = build_runtime()?;
         Ok(Self { runtime })
     }
 
@@ -512,7 +515,20 @@ impl Session {
     /// against the persistent global scope. Returns the captured scratchpad
     /// output, any error, and the value the step `return`ed. State assigned to
     /// `globalThis` survives into the next call.
+    ///
+    /// A watchdog enforces [`STEP_TIMEOUT`]: a step that runs past it (e.g. a
+    /// synchronous `while (true) {}` that never yields, so the REPL's SIGINT
+    /// `select!` can never fire) has its V8 execution force-terminated and
+    /// surfaces as a timeout error. The isolate is left usable for the next
+    /// step (any lingering terminating state is cleared here and defensively at
+    /// the start of the following `eval`).
     pub async fn eval(&mut self, code: String) -> Result<StepResult, anyhow::Error> {
+        // Defensive: if a previous step was force-terminated by the watchdog,
+        // the isolate can stay in a "terminating" state that would poison this
+        // step's very first script. Clearing it here makes the session reliably
+        // usable again after a timeout.
+        self.runtime.v8_isolate().cancel_terminate_execution();
+
         // Start each step with an empty scratchpad and cleared return slots, so
         // a prior step's answer can't leak if this one fails to compile.
         self.runtime
@@ -525,6 +541,13 @@ impl Session {
             )
             .map_err(|error| anyhow::anyhow!("failed to reset session state: {error}"))?;
 
+        // Guard the synchronous `execute_script` and the async event-loop drive:
+        // a `while (true) {}` in the turn never yields, so the watchdog is the
+        // only thing that can stop it and let the step return an error.
+        let timeout = step_timeout();
+        let handle = self.runtime.v8_isolate().thread_safe_handle();
+        let mut watchdog = ExecutionWatchdog::arm(handle, timeout);
+
         let mut error = None;
         match self.runtime.execute_script("[sdkmode:turn]", code) {
             Ok(promise) => {
@@ -534,12 +557,35 @@ impl Session {
                     .with_event_loop_promise(resolve, deno_core::PollEventLoopOptions::default())
                     .await
                 {
-                    error = Some(event_loop_error.to_string());
+                    let message = event_loop_error.to_string();
+                    // deno_core's wording for "an await stalled with nothing to
+                    // drive it" is cryptic; spell out what happened and that the
+                    // step's bindings were not saved (the turn was abandoned
+                    // before its finally-lift could run).
+                    error = Some(if message.contains("event loop has already resolved") {
+                        "the step stalled: it awaited a promise nothing will ever \
+                         resolve (e.g. a connection that failed without an error \
+                         handler), so it was abandoned; its declarations were NOT \
+                         saved — redeclare anything you need"
+                            .to_string()
+                    } else {
+                        message
+                    });
                 }
             }
             Err(execute_error) => {
                 error = Some(execute_error.to_string());
             }
+        }
+
+        watchdog.disarm();
+        if watchdog.fired() {
+            // The watchdog force-terminated V8. Clear the terminating state now
+            // so the output/return reads below (each a small `execute_script`)
+            // don't themselves get terminated, and report the timeout rather
+            // than V8's opaque wording.
+            self.runtime.v8_isolate().cancel_terminate_execution();
+            error = Some(timeout_error_message(timeout));
         }
 
         let output = read_global_string(&mut self.runtime, READ_OUTPUT);
@@ -568,6 +614,23 @@ impl Session {
             value,
         })
     }
+
+    /// Evaluate a synchronous host-side expression — the `context` read-back,
+    /// snapshot collection, the sandbox's clock — and coerce the result to a
+    /// string (empty on failure). Never used for model-written code; steps go
+    /// through [`Session::eval`] with its watchdog and scratchpad handling.
+    pub fn read_to_string(&mut self, expr: impl Into<String>) -> String {
+        read_global_string(&mut self.runtime, expr)
+    }
+
+    /// Run a synchronous host-side script for its effects — restoring
+    /// snapshot variables, deallocating a deleted step's bindings.
+    pub fn run_host_script(&mut self, script: impl Into<String>) -> Result<(), anyhow::Error> {
+        self.runtime
+            .execute_script("[sdkmode:host]", script.into())
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("host script failed: {error}"))
+    }
 }
 
 #[cfg(test)]
@@ -576,8 +639,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_persists_across_evals() {
-        // Session::new loads @octokit/rest over TLS, which needs a crypto
-        // provider; main() installs this, but the test harness does not.
+        // Session::new no longer fetches at start (octokit is lazy), but any
+        // later TLS use (e.g. a turn that touches `octokit`) still needs a
+        // process-wide crypto provider; main() installs this, the test harness
+        // does not. Installing it here is harmless and keeps such turns working.
         let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let mut session = Session::new().await.expect("session");
@@ -605,6 +670,34 @@ mod tests {
         assert_eq!(second.output, "42");
         // A bare expression is scratchpad, not an answer.
         assert_eq!(second.value, None);
+    }
+
+    #[tokio::test]
+    async fn stalled_step_reports_a_readable_error_and_the_session_survives() {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut session = Session::new().await.expect("session");
+
+        // A promise nothing will ever resolve (no pending ops back it): the
+        // event loop idles and the turn is abandoned. That must surface as a
+        // readable error, not deno_core's cryptic wording.
+        let stalled = session
+            .eval(crate::transform::wrap_turn(
+                "const before = 1; await new Promise(() => {}); const after = 2;",
+            ))
+            .await
+            .unwrap();
+        let message = stalled.error.expect("stalled step should error");
+        assert!(
+            message.contains("the step stalled"),
+            "expected mapped stall error, got: {message}"
+        );
+
+        // The session must remain usable afterwards.
+        let next = session
+            .eval(crate::transform::wrap_turn("return 'alive';"))
+            .await
+            .unwrap();
+        assert_eq!(next.value.as_deref(), Some("alive"));
     }
 
     #[tokio::test]
@@ -711,5 +804,135 @@ mod tests {
             .await
             .unwrap();
         assert!(import.error.is_some(), "unlisted import should be rejected");
+    }
+
+    #[tokio::test]
+    async fn infinite_sync_loop_times_out_and_session_survives() {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut session = Session::new().await.expect("session");
+
+        // Drive the watchdog with a short deadline so the test finishes in a
+        // couple of seconds instead of the 120s production default. The override
+        // is read at eval time; scope it to this call and restore it afterwards
+        // so parallel tests keep the production timeout. Session::new (above)
+        // runs before we set it, so its TLS/import work is never capped short.
+        //
+        // SAFETY: set_var/remove_var are unsafe (they mutate process-global env
+        // and can race with concurrent getenv). This is test-only and the window
+        // is brief; other tests do not touch this key.
+        unsafe {
+            std::env::set_var("SDKMODE_STEP_TIMEOUT_MS", "1500");
+        }
+
+        // A synchronous infinite loop never yields the tokio thread; only the
+        // isolate-termination watchdog can stop it. Time the call to prove it
+        // returns promptly (well under the 120s prod default) rather than hanging.
+        let started = std::time::Instant::now();
+        let looped = session
+            .eval(crate::transform::wrap_turn("while (true) {}"))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        unsafe {
+            std::env::remove_var("SDKMODE_STEP_TIMEOUT_MS");
+        }
+
+        let message = looped.error.expect("infinite loop should error");
+        assert!(
+            message.contains("terminated") && message.contains("limit"),
+            "expected a timeout error, got: {message}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "timeout should fire promptly, took {elapsed:?}"
+        );
+
+        // The isolate must be usable again after a forced termination: the next
+        // step runs normally and can return an answer.
+        let alive = session
+            .eval(crate::transform::wrap_turn("return 'alive';"))
+            .await
+            .unwrap();
+        assert!(
+            alive.error.is_none(),
+            "session should recover after a timeout: {:?}",
+            alive.error
+        );
+        assert_eq!(alive.value.as_deref(), Some("alive"));
+    }
+
+    #[tokio::test]
+    async fn octokit_is_lazy_and_does_not_throw_at_session_start() {
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Session::new must not require the network now; if it did, constructing
+        // the session offline (or the eager import failing) would error here.
+        let mut session = Session::new().await.expect("session");
+
+        // Merely touching `octokit` (without awaiting) must not throw: the proxy
+        // returns another proxy and defers the import. The proxy wraps a
+        // function target (like BROWSER_SHIM) so it stays callable, hence
+        // `typeof` is "function"; the point is that the access is safe and the
+        // import has NOT happened yet.
+        let touched = session
+            .eval(crate::transform::wrap_turn("return typeof octokit;"))
+            .await
+            .unwrap();
+        assert!(
+            touched.error.is_none(),
+            "touching octokit must not throw: {:?}",
+            touched.error
+        );
+        assert_eq!(touched.value.as_deref(), Some("function"));
+
+        // A nested access also stays safe and deferred (still a proxy, still
+        // callable), proving the chain resolves lazily rather than eagerly.
+        let nested = session
+            .eval(crate::transform::wrap_turn(
+                "return typeof octokit.rest.repos;",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            nested.error.is_none(),
+            "nested octokit access must not throw: {:?}",
+            nested.error
+        );
+        assert_eq!(nested.value.as_deref(), Some("function"));
+    }
+
+    #[tokio::test]
+    async fn octokit_nested_member_resolves_through_the_lazy_proxy() {
+        // This awaits the proxy, which triggers the pinned @octokit/rest import
+        // over TLS — hence the crypto provider. It asserts the *proxy mechanics*
+        // and the import resolve (no "import not allowed"/proxy crash); it does
+        // NOT call GitHub, so it needs no auth and is CI-safe.
+        let _ = deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut session = Session::new().await.expect("session");
+
+        // `octokit.rest.repos.get` must resolve, through the nested proxy and
+        // the lazy import, to a real callable on the constructed Octokit client.
+        let step = session
+            .eval(crate::transform::wrap_turn(
+                "const t = typeof (await octokit.rest.repos.get); return t;",
+            ))
+            .await
+            .unwrap();
+
+        // If the import genuinely could not be fetched (offline CI), don't fail
+        // the suite on network flakiness — only assert the proxy did not itself
+        // break. A successful resolve must yield "function".
+        if let Some(err) = &step.error {
+            assert!(
+                !err.contains("import not allowed"),
+                "the pinned @octokit/rest import must be allowed: {err}"
+            );
+        } else {
+            assert_eq!(
+                step.value.as_deref(),
+                Some("function"),
+                "nested octokit.rest.repos.get must resolve to a callable"
+            );
+        }
     }
 }

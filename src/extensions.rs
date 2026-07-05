@@ -1,3 +1,15 @@
+/// The full Deno extension set, baked into the snapshot (see `build.rs`) and
+/// re-declared for the runtime (see `crate::sandbox::build_runtime`).
+///
+/// This list cannot be trimmed to reduce attack surface, even though guest code
+/// can never reach most of these (FFI, NAPI, subprocess, KV, cron, WebGPU, … are
+/// all denied at the permission layer). `deno_runtime`'s bundled bootstrap JS
+/// assembles the `Deno.*` namespace by importing every extension's ES module, so
+/// dropping any one — e.g. `deno_webgpu`, `deno_kv`, `deno_cron` — fails the
+/// snapshot build with "Specifier ext:deno_<x>/… was not included in the
+/// snapshot". Removing an extension would mean forking `deno_runtime` to strip
+/// the matching imports from its bootstrap. The real sandbox boundary is the
+/// permission set in `build_runtime`, not the extension list; leave this whole.
 pub fn extensions(
     snapshot_options: Option<deno_runtime::ops::bootstrap::SnapshotOptions>,
 ) -> Vec<deno_core::Extension> {

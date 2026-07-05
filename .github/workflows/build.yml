@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       # Caches the cargo registry and target/ to speed up later runs.
       - uses: Swatinem/rust-cache@v2
@@ -23,6 +25,13 @@ jobs:
       # aws-lc-sys (pulled in via rustls) needs nasm to build on x86_64.
       - name: Install build dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y nasm
+
+      # Fast-failing lint gates before the expensive build.
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Build (release)
         run: cargo build --release --locked
