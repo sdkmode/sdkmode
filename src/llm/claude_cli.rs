@@ -12,7 +12,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use super::{CodeSink, CompletionRequest, LlmProvider, RawCompletion};
+use super::{CodeSink, CompletionRequest, LlmProvider, RawCompletion, Usage};
 
 pub struct ClaudeCli;
 
@@ -112,13 +112,13 @@ async fn run_claude(
     let mut lines = BufReader::new(stdout).lines();
 
     let mut full = String::new();
-    let mut cost_usd = 0.0;
+    let mut usage = Usage::default();
     while let Some(line) = lines.next_line().await? {
         if let Some(delta) = parse_text_delta(&line) {
             full.push_str(&delta);
             sink.on_delta(&delta);
-        } else if let Some(cost) = parse_result_cost(&line) {
-            cost_usd = cost;
+        } else if let Some(result_usage) = parse_result_usage(&line) {
+            usage = result_usage;
         }
     }
 
@@ -128,10 +128,7 @@ async fn run_claude(
         anyhow::bail!("{}", diagnose_failure(&status.to_string(), &stderr));
     }
 
-    Ok(RawCompletion {
-        text: full,
-        cost_usd,
-    })
+    Ok(RawCompletion { text: full, usage })
 }
 
 /// Build a human-readable diagnostic for a non-zero `claude` exit from the exit
@@ -181,12 +178,28 @@ fn looks_like_flag_incompatibility(stderr: &str) -> bool {
 }
 
 /// Pull `total_cost_usd` out of a `stream-json` `result` line, if present.
-fn parse_result_cost(line: &str) -> Option<f64> {
+fn parse_result_usage(line: &str) -> Option<Usage> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     if value.get("type")?.as_str()? != "result" {
         return None;
     }
-    value.get("total_cost_usd")?.as_f64()
+    let tokens = value.get("usage");
+    Some(Usage {
+        input_tokens: tokens
+            .and_then(|usage| usage.get("input_tokens"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        cached_input_tokens: tokens
+            .and_then(|usage| usage.get("cache_read_input_tokens"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        output_tokens: tokens
+            .and_then(|usage| usage.get("output_tokens"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        reasoning_output_tokens: 0,
+        cost_usd: value.get("total_cost_usd").and_then(|value| value.as_f64()),
+    })
 }
 
 /// Pull the text out of a `stream-json` `content_block_delta` line, if that's
@@ -209,7 +222,17 @@ fn parse_text_delta(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::diagnose_failure;
+    use super::{diagnose_failure, parse_result_usage};
+
+    #[test]
+    fn parses_result_cost_and_tokens() {
+        let line = r#"{"type":"result","total_cost_usd":0.012,"usage":{"input_tokens":100,"cache_read_input_tokens":80,"output_tokens":20}}"#;
+        let usage = parse_result_usage(line).unwrap();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_input_tokens, 80);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cost_usd, Some(0.012));
+    }
 
     #[test]
     fn diagnose_flags_cli_incompatibility() {

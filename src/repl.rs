@@ -63,14 +63,9 @@ const SEED_HEADER: &str = r#"// You are a helpful assistant in a REPL that can u
 // preferences — belong in variables, where they follow you everywhere.
 // There is no other memory: never store facts in `context`, and never push
 // items into it — console.log is the place for working notes.
-// `context` is this very conversation: an array of {id, type, ...} messages
-// (type "user" | "step" | "answer" | "note"). It is history, not storage.
-// Prune it — but delete an item only when the whole item is stale. To drop
-// one fact, line, or bulky output from a step, edit its code or output
-// string instead. A variable lives only while some step in context declares
-// or assigns it, so check what a step declares before deleting it, and keep
-// (or re-add) the assignments a summary relies on. When a prune deallocates
-// variables, the step's output will say so.
+// `context` is the conversation array ({id,type,...}), not storage. A binding
+// survives only while some kept step assigns it; pruning reports deallocated
+// names.
 // The last line of this program is a token gauge. Keep context lean; at 95%
 // of the budget, pruning stops being optional — returned answers are
 // rejected until context fits again.
@@ -78,9 +73,6 @@ const SEED_HEADER: &str = r#"// You are a helpful assistant in a REPL that can u
 // (a note will say so), write what is worth keeping about the old project
 // to a file under {archive}/ and prune it from context — then read it back
 // if the user returns to that project.
-// Let code make every decision code can — max, sort, filter, count — and
-// console.log only data you must exercise judgement on. Return a value to
-// answer the user.
 let prompt;
 let context;
 "#;
@@ -285,11 +277,37 @@ fn print_aside(text: &str) {
 /// The status line's note for a phase: `thinking · step 2 · $0.011`. No total
 /// is shown — [`MAX_STEPS`] is a safety cap, not a plan, so a `/12` would
 /// wrongly read as a progress bar. Cost appears once there is any.
-fn status_note(phase: &str, step: usize, cost_usd: f64) -> String {
-    if cost_usd > 0.0 {
-        format!("{phase} · step {step} · ${cost_usd:.3}")
-    } else {
+fn usage_note(usage: llm::Usage) -> String {
+    let mut parts = Vec::new();
+    if usage.total_tokens() > 0 {
+        let mut tokens = vec![
+            format!("{} in", usage.input_tokens),
+            format!("{} out", usage.output_tokens),
+        ];
+        if usage.cached_input_tokens > 0 {
+            tokens.push(format!("{} cached", usage.cached_input_tokens));
+        }
+        if usage.reasoning_output_tokens > 0 {
+            tokens.push(format!("{} reasoning", usage.reasoning_output_tokens));
+        }
+        parts.push(format!(
+            "{} tok ({})",
+            usage.total_tokens(),
+            tokens.join(" · ")
+        ));
+    }
+    if let Some(cost) = usage.cost_usd {
+        parts.push(format!("${cost:.3}"));
+    }
+    parts.join(" · ")
+}
+
+fn status_note(phase: &str, step: usize, usage: llm::Usage) -> String {
+    let usage = usage_note(usage);
+    if usage.is_empty() {
         format!("{phase} · step {step}")
+    } else {
+        format!("{phase} · step {step} · {usage}")
     }
 }
 
@@ -393,7 +411,7 @@ async fn run_turn(
     let mut should_quit = false;
 
     let mut steps = 0usize;
-    let mut cost_usd = 0.0;
+    let mut usage = llm::Usage::default();
     let started = std::time::Instant::now();
 
     // The transient spinner filling the two silent phases: waiting on the
@@ -428,7 +446,7 @@ async fn run_turn(
         let mut block = crate::highlight::CodeBlock::new(&format!("step {}", steps + 1));
         status
             .borrow_mut()
-            .update(&status_note("thinking", steps + 1, cost_usd));
+            .update(&status_note("thinking", steps + 1, usage));
         let completion = {
             let mut sink = StatusSink {
                 inner: &mut block,
@@ -449,7 +467,7 @@ async fn run_turn(
             Ok(completion) if !completion.code.trim().is_empty() => {
                 block.finish();
                 steps += 1;
-                cost_usd += completion.cost_usd;
+                usage.add(completion.usage);
                 completion.code
             }
             Ok(_) => {
@@ -470,7 +488,7 @@ async fn run_turn(
         // trade-off, and the watchdog still bounds the step.
         status
             .borrow_mut()
-            .update(&status_note("running", steps, cost_usd));
+            .update(&status_note("running", steps, usage));
         let serial = CTX_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let executable = build_executable(latest, &code, &transcript.to_json().to_string(), serial);
         let eval_result = {
@@ -556,8 +574,8 @@ async fn run_turn(
             eprintln!();
             crate::markdown::print_answer(&answer);
             transcript.push_answer(answer);
-            emit_metrics(steps, cost_usd, ctx_tokens);
-            print_turn_summary(steps, cost_usd, started.elapsed(), ctx_tokens);
+            emit_metrics(steps, usage, ctx_tokens);
+            print_turn_summary(steps, usage, started.elapsed(), ctx_tokens);
             return should_quit;
         }
 
@@ -565,8 +583,8 @@ async fn run_turn(
     }
 
     let ctx_tokens = estimate_tokens(&build_context(&transcript.entries));
-    emit_metrics(steps, cost_usd, ctx_tokens);
-    print_turn_summary(steps, cost_usd, started.elapsed(), ctx_tokens);
+    emit_metrics(steps, usage, ctx_tokens);
+    print_turn_summary(steps, usage, started.elapsed(), ctx_tokens);
     eprintln!("(the assistant did not return an answer after {MAX_STEPS} steps)");
     should_quit
 }
@@ -586,7 +604,7 @@ fn fmt_tokens(tokens: usize) -> String {
 /// plain when stderr is piped.
 fn print_turn_summary(
     steps: usize,
-    cost_usd: f64,
+    usage: llm::Usage,
     elapsed: std::time::Duration,
     ctx_tokens: usize,
 ) {
@@ -595,8 +613,14 @@ fn print_turn_summary(
         return;
     }
     let plural = if steps == 1 { "" } else { "s" };
+    let usage = usage_note(usage);
+    let usage = if usage.is_empty() {
+        String::new()
+    } else {
+        format!(" · {usage}")
+    };
     let line = format!(
-        "({steps} step{plural} · ${cost_usd:.3} · {:.1}s · ctx {}/{})",
+        "({steps} step{plural}{usage} · {:.1}s · ctx {}/{})",
         elapsed.as_secs_f64(),
         fmt_tokens(ctx_tokens),
         fmt_tokens(token_budget())
@@ -610,11 +634,16 @@ fn print_turn_summary(
 
 /// When `SDKMODE_METRICS` is set, print a machine-readable metrics line on
 /// stderr at the end of a turn, for harnesses like benchmark.py to parse.
-fn emit_metrics(steps: usize, cost_usd: f64, ctx_tokens: usize) {
+fn emit_metrics(steps: usize, usage: llm::Usage, ctx_tokens: usize) {
     if std::env::var_os("SDKMODE_METRICS").is_some() {
         let metrics = serde_json::json!({
             "steps": steps,
-            "cost_usd": cost_usd,
+            "cost_usd": usage.cost_usd,
+            "input_tokens": usage.input_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "output_tokens": usage.output_tokens,
+            "reasoning_output_tokens": usage.reasoning_output_tokens,
+            "total_tokens": usage.total_tokens(),
             "context_tokens": ctx_tokens,
         });
         eprintln!("__sdkmode_metrics {metrics}");
@@ -743,12 +772,12 @@ fn save_session(transcript: &Transcript, session: &mut sandbox::Session) {
 /// Run the REPL. Interactive on a terminal (the inbox-driven loop, with
 /// Discord attached when `SDKMODE_DISCORD_TOKEN` is set); otherwise a plain
 /// one-message-per-line piped loop (kept reproducible for tests/benchmarks).
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(provider: llm::Provider) -> anyhow::Result<()> {
     use std::io::IsTerminal;
 
     let mut transcript = Transcript::new();
     let mut session = sandbox::Session::new().await?;
-    let llm = llm::Llm::new();
+    let llm = llm::Llm::new(provider);
 
     if std::io::stdin().is_terminal() {
         // Sessions persist only on the interactive path: piped runs (tests,
@@ -758,6 +787,257 @@ pub async fn run() -> anyhow::Result<()> {
     } else {
         run_piped(&mut transcript, &mut session, &llm).await
     }
+}
+
+struct TuiSink<'a> {
+    app: &'a std::cell::RefCell<crate::tui::App>,
+}
+
+impl llm::CodeSink for TuiSink<'_> {
+    fn on_delta(&mut self, text: &str) {
+        self.app.borrow_mut().append_code(text);
+    }
+
+    fn on_retry(&mut self) {
+        self.app.borrow_mut().push(
+            crate::tui::MessageKind::Note,
+            "Completion failed; retrying…",
+        );
+    }
+}
+
+fn tui_messages(transcript: &Transcript) -> Vec<crate::tui::Message> {
+    let mut messages = Vec::new();
+    for entry in &transcript.entries {
+        match &entry.kind {
+            EntryKind::User(text) => messages.push(crate::tui::Message {
+                kind: crate::tui::MessageKind::User,
+                text: text.clone(),
+            }),
+            EntryKind::Step {
+                code,
+                output,
+                error,
+            } => {
+                messages.push(crate::tui::Message {
+                    kind: crate::tui::MessageKind::Code,
+                    text: code.clone(),
+                });
+                if !output.trim().is_empty() {
+                    messages.push(crate::tui::Message {
+                        kind: crate::tui::MessageKind::Note,
+                        text: output.clone(),
+                    });
+                }
+                if let Some(error) = error {
+                    messages.push(crate::tui::Message {
+                        kind: crate::tui::MessageKind::Error,
+                        text: error.clone(),
+                    });
+                }
+            }
+            EntryKind::Answer(text) => messages.push(crate::tui::Message {
+                kind: crate::tui::MessageKind::Assistant,
+                text: text.clone(),
+            }),
+            EntryKind::Note(text) => messages.push(crate::tui::Message {
+                kind: crate::tui::MessageKind::Note,
+                text: text.clone(),
+            }),
+        }
+    }
+    messages
+}
+
+fn sync_tui(app: &std::cell::RefCell<crate::tui::App>, transcript: &Transcript) {
+    app.borrow_mut().replace_messages(tui_messages(transcript));
+}
+
+async fn run_turn_tui(
+    latest: &str,
+    transcript: &mut Transcript,
+    session: &mut sandbox::Session,
+    llm: &llm::Llm,
+    app: &std::cell::RefCell<crate::tui::App>,
+) {
+    let mut steps = 0usize;
+    let mut usage = llm::Usage::default();
+    let started = std::time::Instant::now();
+
+    for _ in 0..MAX_STEPS {
+        let context = build_context(&transcript.entries);
+        app.borrow_mut()
+            .set_status(status_note("thinking", steps + 1, usage));
+        app.borrow_mut()
+            .push(crate::tui::MessageKind::Code, String::new());
+        let completion = {
+            let mut sink = TuiSink { app };
+            llm.complete(&context, &mut sink).await
+        };
+        let code = match completion {
+            Ok(completion) if !completion.code.trim().is_empty() => {
+                steps += 1;
+                usage.add(completion.usage);
+                completion.code
+            }
+            Ok(_) => {
+                app.borrow_mut().push(
+                    crate::tui::MessageKind::Error,
+                    "The assistant returned no code.",
+                );
+                break;
+            }
+            Err(error) => {
+                app.borrow_mut().push(
+                    crate::tui::MessageKind::Error,
+                    format!("LLM error: {error}"),
+                );
+                break;
+            }
+        };
+
+        app.borrow_mut()
+            .set_status(status_note("running", steps, usage));
+        let serial = CTX_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let executable = build_executable(latest, &code, &transcript.to_json().to_string(), serial);
+        let result = match session.eval(executable).await {
+            Ok(result) => result,
+            Err(error) => {
+                let error = format!("sandbox error: {error}");
+                transcript.push_step(transform::const_to_let(&code), String::new(), Some(error));
+                sync_tui(app, transcript);
+                break;
+            }
+        };
+
+        let stored_code = transform::const_to_let(&code);
+        let doomed = transcript.reconcile(&session.read_to_string(READ_CONTEXT), serial);
+        let mut output = result.output;
+        if !doomed.is_empty() {
+            let _ = session.run_host_script(dealloc_script(&doomed));
+            let note = dealloc_note(&doomed);
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&note);
+        }
+        let answer = result.value;
+        transcript.push_step(stored_code, output, result.error);
+        // Reconciliation above made the guest's `context` edits authoritative.
+        // Rebuild the visible cards immediately so deletions, edits, and
+        // inserted notes appear in this same step.
+        sync_tui(app, transcript);
+        if let Some(answer) = answer {
+            let ctx_tokens = estimate_tokens(&build_context(&transcript.entries));
+            if ctx_tokens * 20 >= token_budget() * 19 {
+                let rejection = format!(
+                    "answer rejected: context is still over budget (~{ctx_tokens} of {} tokens). Shrink it, then return again.",
+                    token_budget()
+                );
+                transcript.push_note(rejection);
+                sync_tui(app, transcript);
+                continue;
+            }
+            transcript.push_answer(&answer);
+            sync_tui(app, transcript);
+            emit_metrics(steps, usage, ctx_tokens);
+            let plural = if steps == 1 { "" } else { "s" };
+            app.borrow_mut().push(
+                crate::tui::MessageKind::Note,
+                format!(
+                    "{steps} step{plural} · {} · {:.1}s · ctx {}/{}",
+                    usage_note(usage),
+                    started.elapsed().as_secs_f64(),
+                    fmt_tokens(ctx_tokens),
+                    fmt_tokens(token_budget())
+                ),
+            );
+            break;
+        }
+    }
+    app.borrow_mut().set_status(
+        "Enter send · Shift/Alt+Enter newline · Ctrl-C clear · PgUp/PgDn scroll · Ctrl-D quit",
+    );
+}
+
+async fn run_tui(
+    transcript: &mut Transcript,
+    session: &mut sandbox::Session,
+    llm: &llm::Llm,
+) -> anyhow::Result<()> {
+    use crossterm::event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEventKind,
+    };
+
+    let app = std::cell::RefCell::new(crate::tui::App::new()?);
+    app.borrow_mut().replace_messages(tui_messages(transcript));
+    app.borrow_mut().draw()?;
+    let mut shift_held = false;
+    loop {
+        match event::read()? {
+            Event::Key(key)
+                if matches!(
+                    key.code,
+                    KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift)
+                ) =>
+            {
+                shift_held = key.kind != KeyEventKind::Release;
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter
+                    if shift_held
+                        || key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    app.borrow_mut().insert_newline();
+                }
+                KeyCode::Enter
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    let message = app.borrow_mut().take_input().trim().to_string();
+                    if message.is_empty() {
+                        continue;
+                    }
+                    transcript.push_user(&message);
+                    app.borrow_mut()
+                        .push(crate::tui::MessageKind::User, &message);
+                    run_turn_tui(&message, transcript, session, llm, &app).await;
+                    save_session(transcript, session);
+                }
+                KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.borrow_mut().insert_newline();
+                }
+                KeyCode::Char('d')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && app.borrow().input.is_empty() =>
+                {
+                    break;
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.borrow_mut().clear_input();
+                }
+                KeyCode::PageUp => app.borrow_mut().scroll_up(8),
+                KeyCode::PageDown => app.borrow_mut().scroll_down(8),
+                _ => {
+                    app.borrow_mut().input.input(key);
+                }
+            },
+            Event::Paste(text) => {
+                app.borrow_mut().input.insert_str(text);
+            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => app.borrow_mut().scroll_up(3),
+                MouseEventKind::ScrollDown => app.borrow_mut().scroll_down(3),
+                _ => {}
+            },
+            _ => {}
+        }
+        app.borrow_mut().draw()?;
+    }
+    Ok(())
 }
 
 /// Read terminal lines and push them onto the inbox. Runs on a blocking thread
@@ -802,6 +1082,9 @@ async fn run_interactive(
     session: &mut sandbox::Session,
     llm: &llm::Llm,
 ) -> anyhow::Result<()> {
+    if discord_gateway::token().is_none() {
+        return run_tui(transcript, session, llm).await;
+    }
     let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Input>();
     spawn_terminal_reader(inbox_tx.clone());
 
@@ -908,7 +1191,7 @@ async fn run_piped(
 
 #[cfg(test)]
 mod tests {
-    use super::{SEED, dealloc_script, human_elapsed};
+    use super::{SEED, dealloc_script, human_elapsed, tui_messages};
 
     /// The assembled seed must be valid JavaScript — it opens the one growing
     /// program the model completes, so a syntax error here poisons every turn.
@@ -932,6 +1215,16 @@ mod tests {
                 sdk.name()
             );
         }
+    }
+
+    /// The continuous-cleanup contract lives in the system prompt (see
+    /// `llm::PROMPT_CORE`); the seed keeps only the duties the system prompt
+    /// cannot know — the token gauge and binding-survival mechanics.
+    #[test]
+    fn seed_keeps_its_unique_context_duties() {
+        assert!(SEED.contains("token gauge"));
+        assert!(SEED.contains("A binding\n// survives only while some kept step assigns it"));
+        assert!(SEED.contains("pruning reports deallocated"));
     }
 
     #[test]
@@ -961,6 +1254,21 @@ mod tests {
         assert_eq!(super::fmt_tokens(812), "812");
         assert_eq!(super::fmt_tokens(4_200), "4k");
         assert_eq!(super::fmt_tokens(50_000), "50k");
+    }
+
+    #[test]
+    fn visible_messages_follow_reconciled_context() {
+        let mut transcript = crate::transcript::Transcript::new();
+        transcript.push_user("old prompt");
+        transcript.push_answer("old answer");
+        let mut context = transcript.to_json();
+        context.as_array_mut().unwrap().remove(0);
+        let read_back = serde_json::json!({ "serial": 7, "context": context }).to_string();
+        transcript.reconcile(&read_back, 7);
+
+        let messages = tui_messages(&transcript);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "old answer");
     }
 
     #[test]

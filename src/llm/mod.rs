@@ -3,8 +3,8 @@
 //! Split in two: this module owns everything provider-independent — the system
 //! prompt (the product's instruction contract), the retry loop, and the
 //! code-extraction repairs — while an [`LlmProvider`] implementation owns only
-//! how to obtain a raw completion (today: driving the `claude` CLI, see
-//! [`claude_cli`]; a direct Anthropic-API provider would slot in beside it).
+//! how to obtain a raw completion (today: driving either the `claude` or
+//! `codex` CLI; an API provider would slot in beside them).
 //!
 //! The system prompt is deliberately *state on the engine*, not a global: it is
 //! assembled from the SDK registry when the [`Llm`] is constructed and handed
@@ -14,6 +14,26 @@
 use std::pin::Pin;
 
 pub mod claude_cli;
+pub mod codex_cli;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Provider {
+    Claude,
+    #[default]
+    Codex,
+}
+
+impl std::str::FromStr for Provider {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            _ => anyhow::bail!("unknown provider '{value}' (expected 'claude' or 'codex')"),
+        }
+    }
+}
 
 /// Receives the model's streamed output so it can be rendered as it arrives.
 pub trait CodeSink {
@@ -39,8 +59,72 @@ pub struct CompletionRequest<'a> {
 pub struct RawCompletion {
     /// The model's full reply text (possibly with fences/prose to repair).
     pub text: String,
-    /// What this request cost, in USD, if the provider can report it.
-    pub cost_usd: f64,
+    /// Provider-reported billing and token usage for this request.
+    pub usage: Usage,
+}
+
+/// Usage is provider-owned because each CLI exposes different accounting.
+/// Cached input is a subset of input tokens, not an additional token count.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    /// `None` means the provider did not report a dollar-denominated cost.
+    pub cost_usd: Option<f64>,
+}
+
+impl Usage {
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    pub fn add(&mut self, other: Self) {
+        let was_empty = self.input_tokens == 0
+            && self.cached_input_tokens == 0
+            && self.output_tokens == 0
+            && self.reasoning_output_tokens == 0
+            && self.cost_usd.is_none();
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_output_tokens += other.reasoning_output_tokens;
+        self.cost_usd = if was_empty {
+            other.cost_usd
+        } else {
+            match (self.cost_usd, other.cost_usd) {
+                (Some(total), Some(next)) => Some(total + next),
+                _ => None,
+            }
+        };
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::Usage;
+
+    #[test]
+    fn aggregates_reported_cost_and_tokens() {
+        let mut total = Usage::default();
+        total.add(Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cost_usd: Some(0.01),
+            ..Usage::default()
+        });
+        total.add(Usage {
+            input_tokens: 20,
+            cached_input_tokens: 5,
+            output_tokens: 3,
+            cost_usd: Some(0.02),
+            ..Usage::default()
+        });
+        assert_eq!(total.total_tokens(), 35);
+        assert_eq!(total.cached_input_tokens, 5);
+        assert_eq!(total.cost_usd, Some(0.03));
+    }
 }
 
 /// One way of obtaining completions. Implementations should be stateless per
@@ -100,6 +184,12 @@ push, upload) in the NEXT step: if that step fails, the variable is still there 
 to retry with — never rebuild it from scratch, and never re-emit or log the \
 literal. But do not split what code finishes alone: fetch → compute → return is \
 one step.
+- Treat `context` as a small working set, not an append-only log. After every \
+completed unit, immediately delete disposable steps, outputs, errors, and old \
+messages. If a result remains useful, replace bulky code/output with the \
+smallest summary and assignments that preserve it. Keep the current request, \
+unresolved decisions, and bindings future steps still need; remove everything \
+else before it becomes stale. Do this continuously, not only near the budget.
 - To answer the user, you MUST `return` a value (e.g. `return summary;`). \
 Returning ends the turn, shows that value to the user, and hands them control. \
 Format the returned string as Markdown.
@@ -148,7 +238,7 @@ const RETRIES: usize = 1;
 /// One step's result: the extracted JavaScript and what the request cost.
 pub struct Completion {
     pub code: String,
-    pub cost_usd: f64,
+    pub usage: Usage,
 }
 
 /// The engine: a provider plus the system prompt it delivers. Construct one
@@ -159,9 +249,11 @@ pub struct Llm {
 }
 
 impl Llm {
-    /// The default engine: the `claude` CLI provider.
-    pub fn new() -> Self {
-        Self::with_provider(Box::new(claude_cli::ClaudeCli))
+    pub fn new(provider: Provider) -> Self {
+        match provider {
+            Provider::Claude => Self::with_provider(Box::new(claude_cli::ClaudeCli)),
+            Provider::Codex => Self::with_provider(Box::new(codex_cli::CodexCli)),
+        }
     }
 
     pub fn with_provider(provider: Box<dyn LlmProvider>) -> Self {
@@ -193,7 +285,7 @@ impl Llm {
                 Ok(raw) => {
                     return Ok(Completion {
                         code: extract_code(&raw.text),
-                        cost_usd: raw.cost_usd,
+                        usage: raw.usage,
                     });
                 }
                 Err(error) => {
@@ -310,6 +402,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The seed defers continuous context cleanup to the system prompt (see
+    /// `repl::tests::seed_keeps_its_unique_context_duties`), so the contract
+    /// must actually be here.
+    #[test]
+    fn system_prompt_requires_continuous_context_cleanup() {
+        let prompt = build_system_prompt();
+        assert!(prompt.contains("After every completed unit, immediately delete"));
+        assert!(prompt.contains("Do this continuously"));
     }
 
     #[test]

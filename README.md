@@ -28,6 +28,26 @@ Coming soon.
 sdkmode
 ```
 
+Codex CLI is the default completion provider:
+
+```sh
+sdkmode
+```
+
+To use Claude CLI instead:
+
+```sh
+sdkmode --provider claude
+```
+
+Both providers use your existing CLI authentication. Install and authenticate
+either `claude` or `codex` before selecting it.
+
+The interactive terminal UI keeps the conversation scrollable and grows the
+message box as text wraps. Enter sends, Shift+Enter or Alt+Enter inserts a
+newline, Page Up/Page Down (or the mouse wheel) scrolls messages, and Ctrl-D
+exits from an empty message box.
+
 ## Benchmark 
 
 <table>

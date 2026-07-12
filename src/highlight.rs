@@ -8,10 +8,10 @@
 
 use std::sync::LazyLock;
 
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
-use syntect::util::as_24_bit_terminal_escaped;
+use tui_syntax_highlight::syntect::easy::HighlightLines;
+use tui_syntax_highlight::syntect::highlighting::{Theme, ThemeSet};
+use tui_syntax_highlight::syntect::parsing::{SyntaxReference, SyntaxSet};
+use tui_syntax_highlight::syntect::util::as_24_bit_terminal_escaped;
 
 use crate::llm::CodeSink;
 
